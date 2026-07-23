@@ -1,0 +1,7 @@
+# Link against Homebrew's SDL3 (arm64). sdl3-sys links libSDL3.dylib dynamically;
+# these flags let rustc find it at link time and locate it at runtime (rpath).
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-L", "/opt/homebrew/opt/sdl3/lib",
+    "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/sdl3/lib",
+]

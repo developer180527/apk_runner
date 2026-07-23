@@ -1,0 +1,14 @@
+[package]
+name = "androlon-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# scrcpy client: deploy/launch the server via adb, tunnel a socket, parse the
+# video stream into encoded packets, and (later) decode to RGBA frames.
+[dependencies]
+androlon-core = { path = "../androlon-core" }
+# Software H.264 decoder (and encoder, used for the self-test round-trip). This
+# is the cross-platform decode path; VideoToolbox/ffmpeg hw-accel slot in behind
+# the same VideoDecoder trait later.
+openh264 = "0.9"

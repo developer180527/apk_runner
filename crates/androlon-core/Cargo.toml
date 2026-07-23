@@ -1,0 +1,9 @@
+[package]
+name = "androlon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately std-only: no external crates, so the engine builds offline and
+# has no supply-chain surface. (Async/serde can come later behind features.)
+[dependencies]

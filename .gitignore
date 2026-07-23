@@ -1,0 +1,22 @@
+# ── Rust ─────────────────────────────────────────────
+/target/
+# Keep Cargo.lock — Androlon is an application, so a locked,
+# reproducible dependency set is what you want. (Don't ignore it.)
+
+# ── Android SDK (self-contained, ~1–2 GB — never commit) ──
+/.android-sdk/
+
+# ── Downloaded / runtime artifacts ───────────────────
+vendor/scrcpy-server        # third-party binary; re-fetchable (see note)
+*.log
+.emulator.log
+.scrcpy-server.log
+
+# ── Swift reference engine (kept as reference; ignore its build) ──
+Androlon/.build/
+Androlon/.swiftpm/
+
+# ── macOS / editors ──────────────────────────────────
+.DS_Store
+.idea/
+*.xcuserstate

@@ -1,0 +1,22 @@
+[package]
+name = "androlon-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "androlon-app"
+path = "src/main.rs"
+
+[dependencies]
+androlon-core = { path = "../androlon-core" }
+androlon-stream = { path = "../androlon-stream" }
+# SDL3 host: windowing + input + gamepad + (later) SDL_GPU compositor. sdl3-sys is
+# pinned to SDL 3.4.12, matching the brew install; dear-imgui-sdl3 uses the same
+# sdl3 crate, so there is no competing binding.
+sdl3 = "0.18"
+sdl3-sys = "0.6"
+# Management UI. SDLRenderer3 backend draws ImGui into rust-sdl3's WindowCanvas —
+# simplest path for the control panel. (App-surface windows use SDL_GPU later.)
+dear-imgui-rs = "0.15"
+dear-imgui-sdl3 = { version = "0.15", features = ["sdlrenderer3-renderer"] }
