@@ -1,6 +1,8 @@
 //! Thin CLI over androlon-core, mirroring apkrun.sh so the Rust engine can be
 //! exercised before the SDL3/ImGui app exists. The app calls the same core APIs.
 
+mod appify;
+
 use androlon_core::backend::AndroidBackend;
 use androlon_core::{
     Avd, BootProfile, EmulatorService, Gfxstream, GpuBackend, SdkConfig, WindowMode,
@@ -35,6 +37,7 @@ fn main() {
             .map(|_| println!("✓ AVDs ready: {}", engine.list_avds().join(", "))),
         Some("run") => cmd_run(&engine, &cfg, &args),
         Some("scrcpy-probe") => cmd_scrcpy_probe(&cfg),
+        Some("appify") => appify::cmd_appify(&cfg, &args),
         Some("root") => cmd_root(&engine, &args),
         Some("stop") => {
             engine.stop();

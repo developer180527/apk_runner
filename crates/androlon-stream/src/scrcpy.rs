@@ -15,6 +15,7 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 const DEVICE_NAME_LEN: usize = 64;
@@ -43,18 +44,43 @@ pub struct ScrcpyOptions {
     /// Open the control channel (input injection). The server then expects a
     /// second connection on the same tunnel; `start()` makes it.
     pub control: bool,
+    /// Coherence: create a fresh virtual display of this size and capture it
+    /// instead of `display_id`. Each app pane gets its own display, sized by
+    /// us — so its window is always pixel-exact, never letterboxed.
+    pub new_display: Option<(u32, u32)>,
+    /// Android density for the new display (None = device default). Pair the
+    /// pixel size with a matching density or the UI renders the wrong scale:
+    /// e.g. a Retina-sized display (2× window points) wants dpi 320 (2× mdpi).
+    pub new_display_dpi: Option<u32>,
+    /// Launch this package on the captured display once the stream starts.
+    /// Sent as a START_APP *control message* after connecting (it is not a
+    /// server option) — so it requires `control: true`. With `new_display`,
+    /// the app opens on that display.
+    pub start_app: Option<String>,
+    /// Show Android system decorations (nav/status/taskbar) on a new virtual
+    /// display. `false` = pure-app surface for native-feeling windows.
+    pub vd_system_decorations: bool,
 }
+
+/// Per-process counter so concurrent clients (multiple Coherence panes) get
+/// distinct forward-tunnel ports and server ids.
+static NEXT_CLIENT: AtomicU16 = AtomicU16::new(0);
 
 impl Default for ScrcpyOptions {
     fn default() -> Self {
+        let n = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
         ScrcpyOptions {
             server_jar: PathBuf::from("vendor/scrcpy-server"),
             server_version: "4.1".into(),
-            scid: format!("{:08x}", std::process::id() & 0x7fff_ffff),
-            port: 27183,
+            scid: format!("{:08x}", ((std::process::id() & 0x7fff) << 16) | n as u32),
+            port: 27183 + n,
             max_size: 0,
             display_id: 0,
             control: true,
+            new_display: None,
+            new_display_dpi: None,
+            start_app: None,
+            vd_system_decorations: true,
         }
     }
 }
@@ -100,6 +126,15 @@ impl ScrcpyClient {
     /// With `control` on, a second connection on the same tunnel becomes the
     /// input-injection channel (the server accepts video first, then control).
     pub fn start(&mut self) -> Result<(VideoStream, Option<ControlChannel>)> {
+        // Probe for a free local port: the in-process counter can't see other
+        // Androlon processes (each appified .app is its own process), but a
+        // port held by one — or by an active adb forward — fails the bind.
+        for candidate in self.opts.port..self.opts.port + 100 {
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                self.opts.port = candidate;
+                break;
+            }
+        }
         let socket_name = format!("localabstract:scrcpy_{}", self.opts.scid);
         let tcp = format!("tcp:{}", self.opts.port);
 
@@ -110,7 +145,17 @@ impl ScrcpyClient {
         let ver = self.opts.server_version.clone();
         let scid = format!("scid={}", self.opts.scid);
         let max_size = format!("max_size={}", self.opts.max_size);
-        let display = format!("display_id={}", self.opts.display_id);
+        // Coherence: a fresh virtual display per pane, instead of mirroring an
+        // existing display id.
+        let display = match self.opts.new_display {
+            Some((w, h)) => match self.opts.new_display_dpi {
+                Some(dpi) => format!("new_display={w}x{h}/{dpi}"),
+                None => format!("new_display={w}x{h}"),
+            },
+            None => format!("display_id={}", self.opts.display_id),
+        };
+        let decorations = (!self.opts.vd_system_decorations)
+            .then(|| "vd_system_decorations=false".to_string());
         // With control=true the server waits for a *second* connection on the
         // same tunnel before proceeding; we make it below, right after the
         // video socket's dummy byte proves the server is up.
@@ -135,6 +180,10 @@ impl ScrcpyClient {
             &max_size,
             &display,
         ];
+        let mut server_args = server_args;
+        if let Some(d) = decorations.as_deref() {
+            server_args.push(d);
+        }
         let log = self.cfg.sdk_root.join(".scrcpy-server.log");
         let child = spawn_detached(
             &self.cfg.adb(),
@@ -152,7 +201,7 @@ impl ScrcpyClient {
         // Control socket: second connect, no dummy byte (that was video-only).
         // Must happen before read_meta — the server only proceeds to the
         // handshake once every expected socket is connected.
-        let control = if self.opts.control {
+        let mut control = if self.opts.control {
             let ctl = TcpStream::connect(("127.0.0.1", self.opts.port))?;
             Some(ControlChannel::new(ctl))
         } else {
@@ -160,6 +209,21 @@ impl ScrcpyClient {
         };
 
         let meta = read_meta(&stream)?;
+
+        // Coherence: ask the server to launch the app on this connection's
+        // display. After the handshake — the server processes control messages
+        // once streaming is set up.
+        if let Some(pkg) = self.opts.start_app.clone() {
+            match control.as_mut() {
+                Some(ctl) => ctl.send_start_app(&pkg)?,
+                None => {
+                    return Err(StreamError::Protocol(
+                        "start_app requires the control channel (control=true)".into(),
+                    ))
+                }
+            }
+        }
+
         Ok((VideoStream { stream, meta }, control))
     }
 

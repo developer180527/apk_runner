@@ -18,6 +18,7 @@ const TYPE_INJECT_TEXT: u8 = 1;
 const TYPE_INJECT_TOUCH_EVENT: u8 = 2;
 const TYPE_INJECT_SCROLL_EVENT: u8 = 3;
 const TYPE_BACK_OR_SCREEN_ON: u8 = 4;
+const TYPE_START_APP: u8 = 16;
 
 // android.view.KeyEvent / MotionEvent actions.
 pub const ACTION_DOWN: u8 = 0;
@@ -165,6 +166,19 @@ pub fn back_or_screen_on(action: u8) -> Vec<u8> {
     vec![TYPE_BACK_OR_SCREEN_ON, action]
 }
 
+/// Serialize START_APP (2 bytes + name): launch a package on the display this
+/// connection captures (a `new_display` session starts it on that display).
+/// The name is a "tiny string": 1-byte length + UTF-8, so ≤255 bytes.
+/// Prefix `+` to force-stop the app first; prefix `?` to search by label.
+pub fn start_app(name: &str) -> Vec<u8> {
+    let bytes = &name.as_bytes()[..name.len().min(255)];
+    let mut buf = Vec::with_capacity(2 + bytes.len());
+    buf.push(TYPE_START_APP);
+    buf.push(bytes.len() as u8);
+    buf.extend_from_slice(bytes);
+    buf
+}
+
 /// The connected control socket. Writes are small and the socket is nodelay'd,
 /// so sending inline from the UI thread is fine. Construction spawns a drain
 /// thread that discards device→client messages until the socket closes.
@@ -217,6 +231,10 @@ impl ControlChannel {
 
     pub fn send_text(&mut self, text: &str) -> Result<()> {
         self.send(&text_event(text))
+    }
+
+    pub fn send_start_app(&mut self, name: &str) -> Result<()> {
+        self.send(&start_app(name))
     }
 
     pub fn send_back(&mut self) -> Result<()> {

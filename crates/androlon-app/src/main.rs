@@ -40,6 +40,19 @@ fn main() {
         return;
     }
 
+    // Single-app mode (appified bundles): `--app <package>` on the CLI, or
+    // ANDROLON_APP from a bundle's LSEnvironment (Launch Services passes no
+    // custom argv, so generated .apps configure via environment).
+    let app_pkg = args
+        .iter()
+        .position(|a| a == "--app")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| std::env::var("ANDROLON_APP").ok());
+    if let Some(pkg) = app_pkg {
+        app::run_single(&pkg);
+        return;
+    }
+
     // Default: the integrated multi-window shell (management + app surfaces).
     app::run();
 }

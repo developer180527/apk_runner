@@ -84,8 +84,52 @@ fn use_avlayer() -> bool {
         && std::env::var("ANDROLON_PRESENT").map(|v| v != "gpu").unwrap_or(true)
 }
 
+/// Mirror the device's main display (the "phone in a window" pane).
 fn open_live_surface(video: &VideoSubsystem, cfg: &SdkConfig) -> Result<VideoPane, String> {
-    let mut opts = ScrcpyOptions { max_size: 1024, ..ScrcpyOptions::default() };
+    let opts = ScrcpyOptions { max_size: 1024, ..ScrcpyOptions::default() };
+    open_stream_pane(video, cfg, opts, None)
+}
+
+/// Coherence: give `package` its own Android virtual display and present it as
+/// an independent native window. Sized by us → never letterboxed.
+fn open_coherence_surface(
+    video: &VideoSubsystem,
+    cfg: &SdkConfig,
+    package: &str,
+    decorations: bool,
+) -> Result<VideoPane, String> {
+    // Size is in *window points* (default 800x500). The virtual display is
+    // created at 2x pixels with a matching 2x Android density (320 = 2x mdpi),
+    // so the stream is Retina-exact: Android renders at the same physical
+    // resolution the window occupies on a HiDPI screen — no upscaling blur.
+    let (ww, wh) = std::env::var("ANDROLON_COHERENCE_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((800, 500));
+    let dpi = std::env::var("ANDROLON_COHERENCE_DPI")
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(320);
+    let opts = ScrcpyOptions {
+        new_display: Some((ww * 2, wh * 2)),
+        new_display_dpi: Some(dpi),
+        start_app: Some(package.to_string()),
+        vd_system_decorations: decorations,
+        ..ScrcpyOptions::default()
+    };
+    open_stream_pane(video, cfg, opts, Some((package, (ww, wh))))
+}
+
+fn open_stream_pane(
+    video: &VideoSubsystem,
+    cfg: &SdkConfig,
+    mut opts: ScrcpyOptions,
+    // Coherence: (package, window size in points). None = mirror pane.
+    app: Option<(&str, (u32, u32))>,
+) -> Result<VideoPane, String> {
     if let Ok(path) = std::env::var("ANDROLON_SCRCPY_SERVER") {
         opts.server_jar = path.into();
     }
@@ -96,8 +140,17 @@ fn open_live_surface(video: &VideoSubsystem, cfg: &SdkConfig) -> Result<VideoPan
     let (mw, mh) = (stream.meta().width, stream.meta().height);
     let name = stream.meta().device_name.clone();
     let codec = stream.meta().codec.label();
-    let (ww, wh) = fit(mw, mh, 800);
-    let title = format!("Androlon — {name} [{codec}]");
+    // Coherence panes open at their chosen point size (the stream is exactly
+    // 2x that); mirror panes fit the device's aspect under a 800px cap.
+    let (ww, wh) = match app {
+        Some((_, size)) => size,
+        None => fit(mw, mh, 800),
+    };
+    // A Coherence pane is titled as the app, like any native window.
+    let title = match app {
+        Some((pkg, _)) => format!("{pkg} — Androlon"),
+        None => format!("Androlon — {name} [{codec}]"),
+    };
 
     // Zero-copy path: compressed samples → AVSampleBufferDisplayLayer, which
     // decodes + presents on the GPU. No decode thread, no RGBA, no upload.
@@ -255,6 +308,55 @@ impl VideoPane {
     }
 }
 
+/// Single-app mode: this process IS one Android app, as far as macOS cares.
+/// One Coherence window, no management panel, no decorations on the virtual
+/// display; closing the window (or the stream dying) exits the process. This
+/// is what an appified `.app` bundle launches.
+pub fn run_single(package: &str) {
+    let sdl = sdl3::init().expect("SDL_Init");
+    let video = sdl.video().expect("SDL video subsystem");
+    let cfg = SdkConfig::from_env();
+
+    let mut pane = match open_coherence_surface(&video, &cfg, package, false) {
+        Ok(pane) => pane,
+        Err(e) => {
+            eprintln!("✗ {package}: {e}");
+            eprintln!("  (is the Android runtime booted?)");
+            std::process::exit(1);
+        }
+    };
+
+    let mut pump = sdl.event_pump().expect("event pump");
+    'main: loop {
+        for event in pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::Window { win_event: WindowEvent::CloseRequested, .. } => break 'main,
+                ref e => pane.handle_input(e),
+            }
+        }
+
+        let VideoPane { screen, stream_size, .. } = &mut pane;
+        match screen {
+            Screen::Gpu { window, source } => {
+                if let Some(frame) = source.next_frame() {
+                    *stream_size = (frame.width, frame.height);
+                    let _ = window.present(&frame);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Screen::Layer { present, samples, .. } => {
+                while let Ok((sample, size)) = samples.rx.try_recv() {
+                    *stream_size = size;
+                    present.enqueue(&sample);
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+}
+
 pub fn run() {
     let sdl = sdl3::init().expect("SDL_Init");
     let video = sdl.video().expect("SDL video subsystem");
@@ -304,6 +406,20 @@ pub fn run() {
                 panes.push(pane);
             }
             Err(e) => eprintln!("✗ live surface: {e}"),
+        }
+    }
+
+    // Test hook: Coherence — give a package its own virtual-display window.
+    // e.g. ANDROLON_COHERENCE=com.android.settings (comma-separate for several).
+    if let Ok(pkgs) = std::env::var("ANDROLON_COHERENCE") {
+        for pkg in pkgs.split(',').filter(|p| !p.is_empty()) {
+            match open_coherence_surface(&video, &cfg, pkg, true) {
+                Ok(pane) => {
+                    println!("✓ coherence window for {pkg} (id {})", pane.id);
+                    panes.push(pane);
+                }
+                Err(e) => eprintln!("✗ coherence {pkg}: {e}"),
+            }
         }
     }
 
