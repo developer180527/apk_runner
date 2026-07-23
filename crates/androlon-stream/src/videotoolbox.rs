@@ -361,7 +361,7 @@ impl VideoDecoder for VideoToolboxDecoder {
 }
 
 /// Split an Annex-B buffer into NAL payloads (start codes removed).
-fn nal_units(data: &[u8]) -> Vec<&[u8]> {
+pub(crate) fn nal_units(data: &[u8]) -> Vec<&[u8]> {
     let n = data.len();
     let mut starts: Vec<(usize, usize)> = Vec::new(); // (position, start-code length)
     let mut j = 0;
@@ -390,7 +390,7 @@ fn nal_units(data: &[u8]) -> Vec<&[u8]> {
 
 /// Convert Annex-B (start codes) to AVCC (4-byte big-endian length prefixes),
 /// which is what VideoToolbox expects (nal_unit_header_length = 4).
-fn annexb_to_avcc(data: &[u8]) -> Vec<u8> {
+pub(crate) fn annexb_to_avcc(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 16);
     for nal in nal_units(data) {
         out.extend_from_slice(&(nal.len() as u32).to_be_bytes());

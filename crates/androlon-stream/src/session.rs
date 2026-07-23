@@ -29,6 +29,43 @@ pub struct FrameStream {
     _handle: JoinHandle<()>,
 }
 
+/// Zero-copy feed (macOS): no decode thread at all — compressed packets are
+/// wrapped as CMSampleBuffers and sent onward for AVSampleBufferDisplayLayer
+/// to decode + present on the GPU. Every sample is forwarded (H.264 decode
+/// order matters; the *layer* is the decoder, so nothing may be dropped).
+/// Each sample rides with the stream size current at read time, so the UI can
+/// map input coordinates without decoding anything.
+#[cfg(target_os = "macos")]
+pub struct SampleStream {
+    pub rx: Receiver<(crate::samplebuffer::Sample, (u32, u32))>,
+    _handle: JoinHandle<()>,
+}
+
+#[cfg(target_os = "macos")]
+pub fn spawn_samples(mut stream: VideoStream) -> SampleStream {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut assembler = crate::samplebuffer::SampleAssembler::new();
+        loop {
+            let packet = match stream.read_packet() {
+                Ok(p) => p,
+                Err(_) => break, // stream closed / error → end the loop
+            };
+            let size = (stream.meta.width, stream.meta.height);
+            match assembler.push(&packet) {
+                Ok(Some(sample)) => {
+                    if tx.send((sample, size)).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+                Ok(None) => {} // config packet
+                Err(_) => {}   // skip a malformed packet, keep going
+            }
+        }
+    });
+    SampleStream { rx, _handle: handle }
+}
+
 /// Spawn the decode loop. The OpenH264 decoder is created *inside* the thread
 /// (it isn't `Send`), so only the `PacketSource` must cross the boundary.
 pub fn spawn_decode<S: PacketSource + 'static>(mut source: S) -> FrameStream {

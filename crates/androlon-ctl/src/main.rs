@@ -77,13 +77,14 @@ fn cmd_scrcpy_probe(cfg: &SdkConfig) -> androlon_core::Result<()> {
         fail(&format!("deploy failed: {e}"));
     }
     println!("› starting stream (forward tunnel + app_process)…");
-    let mut stream = match client.start() {
+    let (mut stream, control) = match client.start() {
         Ok(s) => s,
         Err(e) => fail(&format!("start failed: {e}\n(check {}/.scrcpy-server.log on device side)", cfg.sdk_root.display())),
     };
 
     let m = stream.meta().clone();
     println!("✓ handshake OK");
+    println!("    control: {}", if control.is_some() { "connected" } else { "off" });
     println!("    device : {}", m.device_name);
     println!("    codec  : {}", m.codec.label());
     println!("    size   : {}x{}", m.width, m.height);

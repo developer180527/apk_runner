@@ -6,6 +6,7 @@
 //! booted device; this module implements the client side faithfully so those
 //! are the only remaining pieces.
 
+use crate::control::ControlChannel;
 use crate::error::{Result, StreamError};
 use crate::model::{Codec, EncodedPacket, StreamMeta};
 use androlon_core::subprocess::spawn_detached;
@@ -39,6 +40,9 @@ pub struct ScrcpyOptions {
     pub max_size: u32,
     /// Android display id to capture (0 = default; others = per-app in Coherence).
     pub display_id: u32,
+    /// Open the control channel (input injection). The server then expects a
+    /// second connection on the same tunnel; `start()` makes it.
+    pub control: bool,
 }
 
 impl Default for ScrcpyOptions {
@@ -50,6 +54,7 @@ impl Default for ScrcpyOptions {
             port: 27183,
             max_size: 0,
             display_id: 0,
+            control: true,
         }
     }
 }
@@ -92,7 +97,9 @@ impl ScrcpyClient {
     }
 
     /// Set up the forward tunnel, launch the server, connect, and read metadata.
-    pub fn start(&mut self) -> Result<VideoStream> {
+    /// With `control` on, a second connection on the same tunnel becomes the
+    /// input-injection channel (the server accepts video first, then control).
+    pub fn start(&mut self) -> Result<(VideoStream, Option<ControlChannel>)> {
         let socket_name = format!("localabstract:scrcpy_{}", self.opts.scid);
         let tcp = format!("tcp:{}", self.opts.port);
 
@@ -104,6 +111,10 @@ impl ScrcpyClient {
         let scid = format!("scid={}", self.opts.scid);
         let max_size = format!("max_size={}", self.opts.max_size);
         let display = format!("display_id={}", self.opts.display_id);
+        // With control=true the server waits for a *second* connection on the
+        // same tunnel before proceeding; we make it below, right after the
+        // video socket's dummy byte proves the server is up.
+        let control = format!("control={}", self.opts.control);
         let server_args: Vec<&str> = vec![
             "shell",
             "CLASSPATH=/data/local/tmp/scrcpy-server.jar",
@@ -113,10 +124,7 @@ impl ScrcpyClient {
             &ver,
             "tunnel_forward=true",
             "audio=false",
-            // A single video socket only: with control=true the server opens a
-            // second socket and blocks waiting for the client to connect to it,
-            // so the video handshake never completes on one connection.
-            "control=false",
+            &control,
             "cleanup=true",
             "video_codec=h264",
             // Request the metadata our parser expects. (send_codec_meta was
@@ -140,8 +148,19 @@ impl ScrcpyClient {
 
         // The server needs a moment to create the abstract socket.
         let stream = connect_retry(self.opts.port, 50, Duration::from_millis(100))?;
+
+        // Control socket: second connect, no dummy byte (that was video-only).
+        // Must happen before read_meta — the server only proceeds to the
+        // handshake once every expected socket is connected.
+        let control = if self.opts.control {
+            let ctl = TcpStream::connect(("127.0.0.1", self.opts.port))?;
+            Some(ControlChannel::new(ctl))
+        } else {
+            None
+        };
+
         let meta = read_meta(&stream)?;
-        Ok(VideoStream { stream, meta })
+        Ok((VideoStream { stream, meta }, control))
     }
 
     pub fn stop(&mut self) {

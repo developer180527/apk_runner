@@ -7,6 +7,9 @@
 //! display), skipping the window and event loop.
 
 mod app;
+#[cfg(target_os = "macos")]
+mod avlayer;
+mod input;
 mod ui;
 mod video;
 
