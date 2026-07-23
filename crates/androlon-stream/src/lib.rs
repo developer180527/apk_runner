@@ -8,8 +8,10 @@ pub mod error;
 pub mod model;
 pub mod scrcpy;
 pub mod session;
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
 
-pub use decode::{NullDecoder, Openh264Decoder, VideoDecoder};
+pub use decode::{make_decoder, DecoderKind, NullDecoder, Openh264Decoder, VideoDecoder};
 pub use encode::TestEncoder;
 pub use error::{Result, StreamError};
 pub use model::{Codec, DecodedFrame, EncodedPacket, StreamMeta};

@@ -55,7 +55,7 @@ fn main() {
 /// connect, print the handshake metadata + first packets, and decode one frame.
 /// Prints everything to stdout so results can be shared for diagnosis.
 fn cmd_scrcpy_probe(cfg: &SdkConfig) -> androlon_core::Result<()> {
-    use androlon_stream::{Openh264Decoder, ScrcpyClient, ScrcpyOptions, VideoDecoder};
+    use androlon_stream::{make_decoder, DecoderKind, ScrcpyClient, ScrcpyOptions};
 
     let adb = androlon_core::AdbService::new(cfg);
     println!("› adb devices:");
@@ -88,8 +88,10 @@ fn cmd_scrcpy_probe(cfg: &SdkConfig) -> androlon_core::Result<()> {
     println!("    codec  : {}", m.codec.label());
     println!("    size   : {}x{}", m.width, m.height);
 
+    let kind = DecoderKind::from_env();
+    println!("› decoder: {} (set ANDROLON_DECODER=vt for hardware)", kind.label());
     println!("› reading first 30 packets…");
-    let mut decoder = Openh264Decoder::new().ok();
+    let mut decoder = make_decoder(kind).ok();
     let (mut n, mut config, mut key, mut decoded, mut bytes) = (0u32, 0u32, 0u32, 0u32, 0usize);
     for _ in 0..30 {
         match stream.read_packet() {

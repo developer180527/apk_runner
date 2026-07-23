@@ -3,7 +3,7 @@
 //! channel that the main (GPU) thread drains and presents. Keeping decode off
 //! the main thread stops a slow frame from stalling the UI.
 
-use crate::decode::{Openh264Decoder, VideoDecoder};
+use crate::decode::{make_decoder, DecoderKind};
 use crate::error::Result;
 use crate::model::{DecodedFrame, EncodedPacket};
 use crate::scrcpy::VideoStream;
@@ -34,7 +34,7 @@ pub struct FrameStream {
 pub fn spawn_decode<S: PacketSource + 'static>(mut source: S) -> FrameStream {
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let mut decoder = match Openh264Decoder::new() {
+        let mut decoder = match make_decoder(DecoderKind::from_env()) {
             Ok(d) => d,
             Err(_) => return,
         };

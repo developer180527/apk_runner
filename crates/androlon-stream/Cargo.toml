@@ -12,3 +12,6 @@ androlon-core = { path = "../androlon-core" }
 # is the cross-platform decode path; VideoToolbox/ffmpeg hw-accel slot in behind
 # the same VideoDecoder trait later.
 openh264 = "0.9"
+
+# macOS hardware decode (VideoToolbox) is done via hand-rolled framework FFI in
+# videotoolbox.rs — no crate deps; frameworks linked with #[link] attributes.

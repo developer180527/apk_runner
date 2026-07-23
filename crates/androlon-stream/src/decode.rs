@@ -17,6 +17,53 @@ pub trait VideoDecoder {
     fn name(&self) -> &'static str;
 }
 
+/// Which decoder backend to use for the H.264 stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecoderKind {
+    /// Cross-platform software decode (OpenH264, CPU).
+    Openh264,
+    /// macOS hardware decode (VideoToolbox, GPU) — near-zero CPU, and the path
+    /// toward zero-copy IOSurface→Metal present.
+    VideoToolbox,
+}
+
+impl DecoderKind {
+    /// Pick from `ANDROLON_DECODER` (`videotoolbox`/`vt` or `openh264`), default
+    /// software for portability.
+    pub fn from_env() -> Self {
+        match std::env::var("ANDROLON_DECODER").as_deref() {
+            Ok("videotoolbox") | Ok("vt") => DecoderKind::VideoToolbox,
+            _ => DecoderKind::Openh264,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            DecoderKind::Openh264 => "openh264 (software)",
+            DecoderKind::VideoToolbox => "videotoolbox (hardware)",
+        }
+    }
+}
+
+/// Build the selected decoder. The whole streaming layer depends only on the
+/// `VideoDecoder` trait, so swapping software↔hardware is this one call.
+pub fn make_decoder(kind: DecoderKind) -> Result<Box<dyn VideoDecoder>> {
+    match kind {
+        DecoderKind::Openh264 => Ok(Box::new(Openh264Decoder::new()?)),
+        DecoderKind::VideoToolbox => {
+            #[cfg(target_os = "macos")]
+            {
+                Ok(Box::new(crate::videotoolbox::VideoToolboxDecoder::new()?))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(crate::error::StreamError::Protocol(
+                    "videotoolbox decoder is macOS-only".into(),
+                ))
+            }
+        }
+    }
+}
+
 /// Placeholder: consumes packets, produces no frames. Useful for measuring
 /// stream throughput without a codec.
 #[derive(Default)]
