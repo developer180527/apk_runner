@@ -16,6 +16,7 @@ name = "androlon-app"
 version = "0.1.0"
 dependencies = [
  "androlon-core",
+ "androlon-ipc",
  "androlon-stream",
  "dear-imgui-rs",
  "dear-imgui-sdl3",
@@ -33,6 +34,18 @@ version = "0.1.0"
 dependencies = [
  "androlon-core",
  "androlon-stream",
+]
+
+[[package]]
+name = "androlon-ipc"
+version = "0.1.0"
+
+[[package]]
+name = "androlon-runtimed"
+version = "0.1.0"
+dependencies = [
+ "androlon-core",
+ "androlon-ipc",
 ]
 
 [[package]]

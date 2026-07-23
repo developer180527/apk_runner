@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 androlon-core = { path = "../androlon-core" }
+androlon-ipc = { path = "../androlon-ipc" }
 androlon-stream = { path = "../androlon-stream" }
 # SDL3 host: windowing + input + gamepad + (later) SDL_GPU compositor. sdl3-sys is
 # pinned to SDL 3.4.12, matching the brew install; dear-imgui-sdl3 uses the same

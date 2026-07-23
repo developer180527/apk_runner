@@ -141,12 +141,16 @@ pub fn appify(
         <string>{sdk}</string>
         <key>ANDROLON_SCRCPY_SERVER</key>
         <string>{server}</string>
+        <key>ANDROLON_RUNTIMED</key>
+        <string>{runtimed}</string>
     </dict>
 </dict>
 </plist>
 "#,
         sdk = sdk_root.display(),
         server = server_jar.display(),
+        // The bundled binary can't find the daemon as a sibling — point at it.
+        runtimed = host_binary.with_file_name("androlon-runtimed").display(),
     );
     std::fs::write(bundle.join("Contents/Info.plist"), plist).map_err(io_err("write plist"))?;
 

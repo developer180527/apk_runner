@@ -5,6 +5,8 @@ members = [
     "crates/androlon-ctl",
     "crates/androlon-stream",
     "crates/androlon-app",
+    "crates/androlon-ipc",
+    "crates/androlon-runtimed",
 ]
 
 [workspace.package]

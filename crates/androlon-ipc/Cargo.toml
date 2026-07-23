@@ -1,0 +1,9 @@
+[package]
+name = "androlon-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The suite's IPC layer: protocol + client for androlon-runtimed.
+# Std-only, like the rest of the engine.
+[dependencies]

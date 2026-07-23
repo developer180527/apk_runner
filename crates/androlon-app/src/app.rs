@@ -147,6 +147,20 @@ fn open_stream_pane(
     if let Ok(path) = std::env::var("ANDROLON_SCRCPY_SERVER") {
         opts.server_jar = path.into();
     }
+
+    // Ask the runtime daemon for the Android runtime (boots it headless if
+    // needed) and hold the lease for this pane's lifetime — the emulator
+    // stays up while any pane is open, and lingers briefly after the last
+    // one closes. If the daemon can't be reached, fall through: a manually
+    // booted device still works exactly as before.
+    let lease = match androlon_ipc::RuntimeLease::acquire() {
+        Ok((lease, _)) => Some(lease),
+        Err(e) => {
+            eprintln!("⚠ runtime daemon unavailable ({e}); assuming a booted device");
+            None
+        }
+    };
+
     let mut client = ScrcpyClient::new(cfg.clone(), opts);
     client.deploy_server().map_err(|e| format!("deploy server: {e}"))?;
     let (stream, audio, ctl) = client.start().map_err(|e| format!("start stream: {e}"))?;
@@ -256,6 +270,7 @@ fn open_stream_pane(
             aim: AimState::default(),
             title,
             hud_t: std::time::Instant::now(),
+            _lease: lease,
         });
     }
 
@@ -278,6 +293,7 @@ fn open_stream_pane(
         aim: AimState::default(),
         title,
         hud_t: std::time::Instant::now(),
+        _lease: lease,
     })
 }
 
@@ -412,6 +428,8 @@ struct VideoPane {
     /// Base window title (the fps HUD appends to it).
     title: String,
     hud_t: std::time::Instant,
+    /// Holds the runtime daemon's boot lease while this pane is open.
+    _lease: Option<androlon_ipc::RuntimeLease>,
 }
 
 impl VideoPane {
@@ -779,6 +797,7 @@ pub fn run() {
                 aim: AimState::default(),
                 title: "Androlon — App surface".into(),
                 hud_t: std::time::Instant::now(),
+                _lease: None,
             });
         }
     }
@@ -885,6 +904,7 @@ pub fn run() {
                         aim: AimState::default(),
                         title: "Androlon — App surface".into(),
                         hud_t: std::time::Instant::now(),
+                        _lease: None,
                     }),
                     None => app.log_line("✗ could not start decoder for app surface"),
                 },

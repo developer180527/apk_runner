@@ -58,12 +58,28 @@ impl EmulatorService {
         log_file: &Path,
         timeout: Duration,
     ) -> Result<()> {
+        self.boot_and_wait_opts(avd, profile, log_file, timeout, false)
+    }
+
+    /// `headless` hides the emulator's own window (`-no-window`) — the suite
+    /// presents Android through Coherence panes, so the runtime stays unseen.
+    pub fn boot_and_wait_opts(
+        &self,
+        avd: &Avd,
+        profile: BootProfile,
+        log_file: &Path,
+        timeout: Duration,
+        headless: bool,
+    ) -> Result<()> {
         if !is_executable(&self.config.emulator()) {
             return Err(EngineError::SdkMissing("emulator".into()));
         }
         let mut args: Vec<String> = vec!["-avd".into(), avd.name.clone()];
         args.extend(profile.snapshot_args());
         args.extend(self.gpu.emulator_args());
+        if headless {
+            args.push("-no-window".into());
+        }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let _child = spawn_detached(
             &self.config.emulator(),
