@@ -195,6 +195,43 @@ fn open_stream_pane(
     })
 }
 
+/// The zero-friction install flow: APK → install into the runtime → generate
+/// a `.app` bundle in ~/Applications → launch it. Runs on its own thread;
+/// progress goes to the management log via `tx`.
+fn install_apk(apk: String, cfg: SdkConfig, tx: std::sync::mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        let log = |s: String| {
+            let _ = tx.send(s);
+        };
+        log(format!("› installing {apk}…"));
+        let out_dir = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Applications"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            log(format!("✗ create {}: {e}", out_dir.display()));
+            return;
+        }
+        let host = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                log(format!("✗ locate androlon-app: {e}"));
+                return;
+            }
+        };
+        match androlon_core::appify::appify(&cfg, apk.as_ref(), &out_dir, &host) {
+            Ok(outcome) => {
+                if !outcome.installed {
+                    log("⚠ APK not installed (is the runtime booted?)".into());
+                }
+                log(format!("✓ {} → {}", outcome.label, outcome.bundle.display()));
+                log(format!("› launching {}…", outcome.label));
+                let _ = std::process::Command::new("open").arg(&outcome.bundle).status();
+            }
+            Err(e) => log(format!("✗ appify failed: {e}")),
+        }
+    });
+}
+
 /// How a pane gets pixels on screen.
 enum Screen {
     /// Portable: decoded RGBA frames uploaded + blitted via SDL_GPU.
@@ -380,6 +417,9 @@ pub fn run() {
     let mut app = AppState::new(cfg.clone());
     let mut panes: Vec<VideoPane> = Vec::new();
 
+    // Install-flow progress: appify jobs run on threads and report here.
+    let (install_tx, install_rx) = std::sync::mpsc::channel::<String>();
+
     // Test hook: open a decode-demo app surface at startup so the multi-window
     // path (SDL_Renderer + SDL_GPU coexisting) can be verified without clicking.
     if std::env::var("ANDROLON_AUTO_SURFACE").is_ok() {
@@ -436,6 +476,14 @@ pub fn run() {
                     }
                     panes.retain(|p| p.id != window_id); // close just that surface
                 }
+                // An .apk arriving — dragged onto a window, or double-clicked
+                // in Finder (macOS delivers "open document" as a drop event).
+                // Install + appify + launch, off-thread so the UI keeps going.
+                Event::DropFile { ref filename, .. }
+                    if filename.to_lowercase().ends_with(".apk") =>
+                {
+                    install_apk(filename.clone(), cfg.clone(), install_tx.clone());
+                }
                 // Input on an app surface → inject into the device.
                 Event::MouseButtonDown { window_id, .. }
                 | Event::MouseButtonUp { window_id, .. }
@@ -454,6 +502,9 @@ pub fn run() {
         }
 
         app.poll();
+        while let Ok(line) = install_rx.try_recv() {
+            app.log_line(line);
+        }
 
         // Draw the management window.
         backend.new_frame(&mut imgui);

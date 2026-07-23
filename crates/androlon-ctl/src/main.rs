@@ -38,6 +38,7 @@ fn main() {
         Some("run") => cmd_run(&engine, &cfg, &args),
         Some("scrcpy-probe") => cmd_scrcpy_probe(&cfg),
         Some("appify") => appify::cmd_appify(&cfg, &args),
+        Some("bundle-host") => appify::cmd_bundle_host(&cfg, &args),
         Some("root") => cmd_root(&engine, &args),
         Some("stop") => {
             engine.stop();

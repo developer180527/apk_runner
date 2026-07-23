@@ -3,6 +3,7 @@
 //! anything OS-specific lives behind the `backend` traits.
 
 pub mod adb;
+pub mod appify;
 pub mod backend;
 pub mod config;
 pub mod emulator;
