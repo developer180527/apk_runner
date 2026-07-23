@@ -84,6 +84,12 @@ pub struct AvLayerPresenter {
     enqueue_sel: Sel,
 }
 
+// CALayer/AVSampleBufferDisplayLayer enqueue is callable from any thread, and
+// the presenter's fields are immutable after construction — so the stream
+// thread may enqueue directly (frames hit the display with zero polling).
+unsafe impl Send for AvLayerPresenter {}
+unsafe impl Sync for AvLayerPresenter {}
+
 impl AvLayerPresenter {
     /// Attach a display layer covering the SDL window's content view.
     pub fn new(window: &Window) -> Result<Self, String> {

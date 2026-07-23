@@ -8,6 +8,7 @@
 //! is the only change needed to show a live Android display.
 
 use crate::input;
+use crate::keymap::{Action, JoyState, Keymap};
 use crate::ui::AppState;
 use crate::video::{self, VideoWindow};
 use androlon_core::SdkConfig;
@@ -64,6 +65,10 @@ impl FrameProducer {
     }
 }
 
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// Fit `(w, h)` within a `cap`-px longest side, preserving aspect ratio.
 fn fit(w: u32, h: u32, cap: u32) -> (u32, u32) {
     let longest = w.max(h).max(1);
@@ -118,6 +123,10 @@ fn open_coherence_surface(
         new_display_dpi: Some(dpi),
         start_app: Some(package.to_string()),
         vd_system_decorations: decorations,
+        // Game-friendly stream: explicit 60 fps target and a generous bitrate
+        // (localhost, so bandwidth is free — artifacts aren't).
+        max_fps: env_u32("ANDROLON_FPS", 60),
+        video_bit_rate: env_u32("ANDROLON_BITRATE", 16_000_000),
         ..ScrcpyOptions::default()
     };
     open_stream_pane(video, cfg, opts, Some((package, (ww, wh))))
@@ -137,6 +146,15 @@ fn open_stream_pane(
     client.deploy_server().map_err(|e| format!("deploy server: {e}"))?;
     let (stream, ctl) = client.start().map_err(|e| format!("start stream: {e}"))?;
 
+    // Game keybindings, if the user wrote a profile for this package.
+    let keymap = app.and_then(|(pkg, _)| {
+        let map = Keymap::load(pkg);
+        if map.is_some() {
+            println!("✓ keymap loaded for {pkg} (~/.androlon/keymaps/{pkg}.conf)");
+        }
+        map
+    });
+
     let (mw, mh) = (stream.meta().width, stream.meta().height);
     let name = stream.meta().device_name.clone();
     let codec = stream.meta().codec.label();
@@ -153,9 +171,13 @@ fn open_stream_pane(
     };
 
     // Zero-copy path: compressed samples → AVSampleBufferDisplayLayer, which
-    // decodes + presents on the GPU. No decode thread, no RGBA, no upload.
+    // decodes + presents on the GPU. No decode thread, no RGBA, no upload —
+    // and the stream thread enqueues directly, so frames skip the UI loop.
     #[cfg(target_os = "macos")]
     if use_avlayer() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
         let window = video
             .window(&title, ww, wh)
             .position_centered()
@@ -166,15 +188,26 @@ fn open_stream_pane(
         // video edge-to-edge instead of letterboxing it.
         let aspect = mw as f32 / mh.max(1) as f32;
         unsafe { sdl3_sys::video::SDL_SetWindowAspectRatio(window.raw(), aspect, aspect) };
-        let present = crate::avlayer::AvLayerPresenter::new(&window)?;
+        let present = Arc::new(crate::avlayer::AvLayerPresenter::new(&window)?);
         let id = window.id();
-        let samples = androlon_stream::spawn_samples(stream);
+        // Stream size shared with the input path (updates on rotation).
+        let size = Arc::new(AtomicU64::new(pack_size(mw, mh)));
+        let feed = {
+            let present = Arc::clone(&present);
+            let size = Arc::clone(&size);
+            androlon_stream::spawn_samples(stream, move |sample, (w, h)| {
+                size.store(pack_size(w, h), Ordering::Relaxed);
+                present.enqueue(&sample);
+            })
+        };
         return Ok(VideoPane {
-            screen: Screen::Layer { window, present, samples, _client: client },
+            screen: Screen::Layer { window, _present: present, size, _feed: feed, _client: client },
             id,
             control: ctl,
             stream_size: (mw, mh),
             touch_down: false,
+            keymap,
+            joy: JoyState::default(),
         });
     }
 
@@ -192,21 +225,25 @@ fn open_stream_pane(
         control: ctl,
         stream_size: (mw, mh),
         touch_down: false,
+        keymap,
+        joy: JoyState::default(),
     })
 }
 
-/// The zero-friction install flow: APK → install into the runtime → generate
-/// a `.app` bundle in ~/Applications → launch it. Runs on its own thread;
-/// progress goes to the management log via `tx`.
-fn install_apk(apk: String, cfg: SdkConfig, tx: std::sync::mpsc::Sender<String>) {
+/// The confirmed install: APK → install into the runtime → generate a `.app`
+/// bundle in `out_dir` → launch it. Runs on its own thread; progress goes to
+/// the management log via `tx`.
+fn install_apk(
+    apk: String,
+    out_dir: std::path::PathBuf,
+    cfg: SdkConfig,
+    tx: std::sync::mpsc::Sender<String>,
+) {
     std::thread::spawn(move || {
         let log = |s: String| {
             let _ = tx.send(s);
         };
         log(format!("› installing {apk}…"));
-        let out_dir = std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join("Applications"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
             log(format!("✗ create {}: {e}", out_dir.display()));
             return;
@@ -236,15 +273,26 @@ fn install_apk(apk: String, cfg: SdkConfig, tx: std::sync::mpsc::Sender<String>)
 enum Screen {
     /// Portable: decoded RGBA frames uploaded + blitted via SDL_GPU.
     Gpu { window: VideoWindow, source: FrameProducer },
-    /// macOS zero-copy: compressed samples enqueued to a CoreAnimation layer.
+    /// macOS zero-copy: the stream thread enqueues compressed samples straight
+    /// to a CoreAnimation layer; the UI loop only reads the size for input.
     #[cfg(target_os = "macos")]
     Layer {
         window: sdl3::video::Window,
-        present: crate::avlayer::AvLayerPresenter,
-        samples: androlon_stream::SampleStream,
+        _present: std::sync::Arc<crate::avlayer::AvLayerPresenter>,
+        /// Packed (w << 32 | h), written by the stream thread on rotation.
+        size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        _feed: androlon_stream::SampleFeed,
         /// Keeps the scrcpy server + tunnel alive for the pane's lifetime.
         _client: ScrcpyClient,
     },
+}
+
+fn pack_size(w: u32, h: u32) -> u64 {
+    ((w as u64) << 32) | h as u64
+}
+
+fn unpack_size(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
 }
 
 impl Screen {
@@ -267,6 +315,9 @@ struct VideoPane {
     stream_size: (u32, u32),
     /// Left button held → we're mid-touch and motion becomes ACTION_MOVE.
     touch_down: bool,
+    /// Game keybindings (keys → synthetic touches); None = plain keyboard.
+    keymap: Option<Keymap>,
+    joy: JoyState,
 }
 
 impl VideoPane {
@@ -328,19 +379,78 @@ impl VideoPane {
                 let ctl = self.control.as_mut().unwrap();
                 let _ = ctl.send_scroll(pos, x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
             }
-            Event::KeyDown { keycode: Some(key), keymod, .. } => {
-                if let Some(ak) = input::android_keycode(key) {
+            Event::KeyDown { keycode: Some(key), keymod, repeat, .. } => {
+                // Keymap bindings swallow the key (including auto-repeats);
+                // unmapped keys go to Android as keyboard input.
+                if let Some(action) = self.keymap.as_ref().and_then(|m| m.get(key)) {
+                    if !repeat {
+                        self.apply_binding(action, true);
+                    }
+                } else if let Some(ak) = input::android_keycode(key) {
                     let ctl = self.control.as_mut().unwrap();
                     let _ = ctl.send_key(control::ACTION_DOWN, ak, input::meta_of(keymod));
                 }
             }
             Event::KeyUp { keycode: Some(key), keymod, .. } => {
-                if let Some(ak) = input::android_keycode(key) {
+                if let Some(action) = self.keymap.as_ref().and_then(|m| m.get(key)) {
+                    self.apply_binding(action, false);
+                } else if let Some(ak) = input::android_keycode(key) {
                     let ctl = self.control.as_mut().unwrap();
                     let _ = ctl.send_key(control::ACTION_UP, ak, input::meta_of(keymod));
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Turn a key binding press/release into synthetic touch traffic.
+    fn apply_binding(&mut self, action: Action, down: bool) {
+        let (sw, sh) = self.stream_size;
+        let at = |nx: f32, ny: f32| Position {
+            x: (nx * sw as f32) as i32,
+            y: (ny * sh as f32) as i32,
+            width: sw as u16,
+            height: sh as u16,
+        };
+        match action {
+            Action::Tap { x, y, pointer } => {
+                let (act, pressure) = if down {
+                    (control::ACTION_DOWN, 1.0)
+                } else {
+                    (control::ACTION_UP, 0.0)
+                };
+                let msg = control::touch_event(act, pointer, at(x, y), pressure, 0, 0);
+                let _ = self.control.as_mut().unwrap().send(&msg);
+            }
+            Action::Joy { dx, dy } => {
+                let Some(cfg) = self.keymap.as_ref().and_then(|m| m.joystick) else {
+                    return;
+                };
+                if down {
+                    self.joy.press(dx, dy);
+                } else {
+                    self.joy.release(dx, dy);
+                }
+                // Sync the persistent joystick finger with the held keys.
+                let msg = match (self.joy.direction(), self.joy.down) {
+                    (Some((jx, jy)), false) => {
+                        self.joy.down = true;
+                        let pos = at(cfg.cx + jx * cfg.radius, cfg.cy + jy * cfg.radius);
+                        control::touch_event(control::ACTION_DOWN, cfg.pointer, pos, 1.0, 0, 0)
+                    }
+                    (Some((jx, jy)), true) => {
+                        let pos = at(cfg.cx + jx * cfg.radius, cfg.cy + jy * cfg.radius);
+                        control::touch_event(control::ACTION_MOVE, cfg.pointer, pos, 1.0, 0, 0)
+                    }
+                    (None, true) => {
+                        self.joy.down = false;
+                        let pos = at(cfg.cx, cfg.cy);
+                        control::touch_event(control::ACTION_UP, cfg.pointer, pos, 0.0, 0, 0)
+                    }
+                    (None, false) => return,
+                };
+                let _ = self.control.as_mut().unwrap().send(&msg);
+            }
         }
     }
 }
@@ -382,15 +492,14 @@ pub fn run_single(package: &str) {
                 }
             }
             #[cfg(target_os = "macos")]
-            Screen::Layer { present, samples, .. } => {
-                while let Ok((sample, size)) = samples.rx.try_recv() {
-                    *stream_size = size;
-                    present.enqueue(&sample);
-                }
+            Screen::Layer { size, .. } => {
+                *stream_size = unpack_size(size.load(std::sync::atomic::Ordering::Relaxed));
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        // Frames bypass this loop (stream thread → layer); it only services
+        // input, so poll tightly for low input latency.
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -434,6 +543,8 @@ pub fn run() {
                 control: None,
                 stream_size: (640, 360),
                 touch_down: false,
+                keymap: None,
+                joy: JoyState::default(),
             });
         }
     }
@@ -478,11 +589,15 @@ pub fn run() {
                 }
                 // An .apk arriving — dragged onto a window, or double-clicked
                 // in Finder (macOS delivers "open document" as a drop event).
-                // Install + appify + launch, off-thread so the UI keeps going.
+                // Inspect it (fast, read-only) and show the installer dialog;
+                // nothing is installed until the user confirms.
                 Event::DropFile { ref filename, .. }
                     if filename.to_lowercase().ends_with(".apk") =>
                 {
-                    install_apk(filename.clone(), cfg.clone(), install_tx.clone());
+                    match androlon_core::appify::inspect(&cfg, filename.as_ref()) {
+                        Ok(info) => app.request_install(filename.clone(), info),
+                        Err(e) => app.log_line(format!("✗ {filename}: {e}")),
+                    }
                 }
                 // Input on an app surface → inject into the device.
                 Event::MouseButtonDown { window_id, .. }
@@ -505,6 +620,10 @@ pub fn run() {
         while let Ok(line) = install_rx.try_recv() {
             app.log_line(line);
         }
+        // Run an install the user just confirmed in the dialog.
+        if let Some(p) = app.take_install() {
+            install_apk(p.apk, p.dest.into(), cfg.clone(), install_tx.clone());
+        }
 
         // Draw the management window.
         backend.new_frame(&mut imgui);
@@ -526,6 +645,8 @@ pub fn run() {
                         control: None,
                         stream_size: (640, 360),
                         touch_down: false,
+                        keymap: None,
+                        joy: JoyState::default(),
                     }),
                     None => app.log_line("✗ could not start decoder for app surface"),
                 },
@@ -554,15 +675,11 @@ pub fn run() {
                         let _ = window.present(&frame);
                     }
                 }
-                // Enqueue *every* sample (the layer is the decoder — H.264
-                // needs each frame in order; latency is bounded by
-                // DisplayImmediately, not by dropping).
+                // Frames are enqueued by the stream thread; just refresh the
+                // size the input path scales against.
                 #[cfg(target_os = "macos")]
-                Screen::Layer { present, samples, .. } => {
-                    while let Ok((sample, size)) = samples.rx.try_recv() {
-                        *stream_size = size;
-                        present.enqueue(&sample);
-                    }
+                Screen::Layer { size, .. } => {
+                    *stream_size = unpack_size(size.load(std::sync::atomic::Ordering::Relaxed));
                 }
             }
         }

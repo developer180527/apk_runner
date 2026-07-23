@@ -30,20 +30,26 @@ pub struct FrameStream {
 }
 
 /// Zero-copy feed (macOS): no decode thread at all — compressed packets are
-/// wrapped as CMSampleBuffers and sent onward for AVSampleBufferDisplayLayer
-/// to decode + present on the GPU. Every sample is forwarded (H.264 decode
-/// order matters; the *layer* is the decoder, so nothing may be dropped).
-/// Each sample rides with the stream size current at read time, so the UI can
+/// wrapped as CMSampleBuffers and handed to `sink` *on this thread*, straight
+/// off the socket. The sink enqueues to AVSampleBufferDisplayLayer (safe from
+/// any thread), so a frame reaches the display the moment it arrives — no
+/// main-loop polling jitter in the frame path. Every sample is forwarded
+/// (H.264 decode order matters; the *layer* is the decoder, nothing may be
+/// dropped). The stream size current at read time rides along so the UI can
 /// map input coordinates without decoding anything.
+///
+/// Returns a guard; dropping it detaches (the thread ends when the stream
+/// closes, e.g. on client Drop tearing down the tunnel).
 #[cfg(target_os = "macos")]
-pub struct SampleStream {
-    pub rx: Receiver<(crate::samplebuffer::Sample, (u32, u32))>,
+pub struct SampleFeed {
     _handle: JoinHandle<()>,
 }
 
 #[cfg(target_os = "macos")]
-pub fn spawn_samples(mut stream: VideoStream) -> SampleStream {
-    let (tx, rx) = mpsc::channel();
+pub fn spawn_samples<F>(mut stream: VideoStream, mut sink: F) -> SampleFeed
+where
+    F: FnMut(crate::samplebuffer::Sample, (u32, u32)) + Send + 'static,
+{
     let handle = thread::spawn(move || {
         let mut assembler = crate::samplebuffer::SampleAssembler::new();
         loop {
@@ -53,17 +59,13 @@ pub fn spawn_samples(mut stream: VideoStream) -> SampleStream {
             };
             let size = (stream.meta.width, stream.meta.height);
             match assembler.push(&packet) {
-                Ok(Some(sample)) => {
-                    if tx.send((sample, size)).is_err() {
-                        break; // receiver dropped
-                    }
-                }
+                Ok(Some(sample)) => sink(sample, size),
                 Ok(None) => {} // config packet
                 Err(_) => {}   // skip a malformed packet, keep going
             }
         }
     });
-    SampleStream { rx, _handle: handle }
+    SampleFeed { _handle: handle }
 }
 
 /// Spawn the decode loop. The OpenH264 decoder is created *inside* the thread

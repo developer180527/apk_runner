@@ -39,6 +39,14 @@ enum Msg {
     Done,
 }
 
+/// An APK waiting for the user's go-ahead in the installer dialog.
+pub struct PendingInstall {
+    pub apk: String,
+    pub info: androlon_core::appify::ApkInfo,
+    /// Destination folder for the generated .app (editable in the dialog).
+    pub dest: String,
+}
+
 pub struct AppState {
     cfg: SdkConfig,
     report: DoctorReport,
@@ -48,6 +56,8 @@ pub struct AppState {
     open_video: bool,
     open_live: bool,
     rx: Option<Receiver<Msg>>,
+    pending_install: Option<PendingInstall>,
+    confirmed_install: Option<PendingInstall>,
 }
 
 impl AppState {
@@ -65,7 +75,23 @@ impl AppState {
             open_video: false,
             open_live: false,
             rx: None,
+            pending_install: None,
+            confirmed_install: None,
         }
+    }
+
+    /// Queue the installer dialog for a dropped/double-clicked APK.
+    pub fn request_install(&mut self, apk: String, info: androlon_core::appify::ApkInfo) {
+        let dest = std::env::var("HOME")
+            .map(|h| format!("{h}/Applications"))
+            .unwrap_or_else(|_| ".".into());
+        self.push_log(format!("› install requested: {} ({})", info.label, info.package));
+        self.pending_install = Some(PendingInstall { apk, info, dest });
+    }
+
+    /// Consume a confirmed install (the app loop runs it).
+    pub fn take_install(&mut self) -> Option<PendingInstall> {
+        self.confirmed_install.take()
     }
 
     /// Consume a pending "open app surface window" (demo) request.
@@ -227,6 +253,51 @@ impl AppState {
                     ui.text(line);
                 }
             });
+
+        // Installer dialog: shown while an APK awaits confirmation. Details
+        // come from `aapt2 dump badging`; nothing is written until Install.
+        let mut install_clicked = false;
+        let mut cancel_clicked = false;
+        if let Some(pending) = &mut self.pending_install {
+            let info = &pending.info;
+            let title = format!("Install “{}”?###installer", info.label);
+            ui.window(title)
+                .size([420.0, 260.0], Condition::FirstUseEver)
+                .position([260.0, 180.0], Condition::FirstUseEver)
+                .build(|| {
+                    ui.text_colored([0.6, 0.85, 1.0, 1.0], &info.label);
+                    ui.separator();
+                    ui.bullet_text(format!("Package   {}", info.package));
+                    ui.bullet_text(format!("Version   {}", info.version));
+                    ui.bullet_text(format!("Min SDK   API {}", info.min_sdk));
+                    ui.bullet_text(format!(
+                        "Size      {:.1} MB",
+                        info.size_bytes as f64 / (1024.0 * 1024.0)
+                    ));
+                    ui.spacing();
+                    ui.text("Create the Mac app in:");
+                    ui.input_text("##dest", &mut pending.dest).build();
+                    ui.text_colored(
+                        [0.7, 0.7, 0.75, 1.0],
+                        "Installs into the Android runtime and creates a native app.",
+                    );
+                    ui.spacing();
+                    if ui.button("Install") {
+                        install_clicked = true;
+                    }
+                    ui.same_line();
+                    if ui.button("Cancel") {
+                        cancel_clicked = true;
+                    }
+                });
+        }
+        if install_clicked {
+            self.confirmed_install = self.pending_install.take();
+        } else if cancel_clicked {
+            if let Some(p) = self.pending_install.take() {
+                self.push_log(format!("✗ install of {} cancelled", p.info.label));
+            }
+        }
 
         if toggle_profile {
             self.profile = match self.profile {

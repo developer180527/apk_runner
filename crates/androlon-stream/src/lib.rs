@@ -22,4 +22,4 @@ pub use model::{Codec, DecodedFrame, EncodedPacket, StreamMeta};
 pub use scrcpy::{ScrcpyClient, ScrcpyOptions, VideoStream};
 pub use session::{spawn_decode, FrameStream, PacketSource};
 #[cfg(target_os = "macos")]
-pub use session::{spawn_samples, SampleStream};
+pub use session::{spawn_samples, SampleFeed};

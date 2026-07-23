@@ -39,6 +39,11 @@ pub struct ScrcpyOptions {
     pub port: u16,
     /// 0 = device resolution; else clamp the longer side to this many px.
     pub max_size: u32,
+    /// Target frame rate (0 = server default). Games want an explicit 60+.
+    pub max_fps: u32,
+    /// Encoder bitrate in bits/s (0 = server default 8 Mbps). Higher = less
+    /// compression artifacting in fast motion; localhost bandwidth is free.
+    pub video_bit_rate: u32,
     /// Android display id to capture (0 = default; others = per-app in Coherence).
     pub display_id: u32,
     /// Open the control channel (input injection). The server then expects a
@@ -75,6 +80,8 @@ impl Default for ScrcpyOptions {
             scid: format!("{:08x}", ((std::process::id() & 0x7fff) << 16) | n as u32),
             port: 27183 + n,
             max_size: 0,
+            max_fps: 0,
+            video_bit_rate: 0,
             display_id: 0,
             control: true,
             new_display: None,
@@ -156,6 +163,9 @@ impl ScrcpyClient {
         };
         let decorations = (!self.opts.vd_system_decorations)
             .then(|| "vd_system_decorations=false".to_string());
+        let max_fps = (self.opts.max_fps > 0).then(|| format!("max_fps={}", self.opts.max_fps));
+        let bit_rate = (self.opts.video_bit_rate > 0)
+            .then(|| format!("video_bit_rate={}", self.opts.video_bit_rate));
         // With control=true the server waits for a *second* connection on the
         // same tunnel before proceeding; we make it below, right after the
         // video socket's dummy byte proves the server is up.
@@ -183,6 +193,12 @@ impl ScrcpyClient {
         let mut server_args = server_args;
         if let Some(d) = decorations.as_deref() {
             server_args.push(d);
+        }
+        if let Some(f) = max_fps.as_deref() {
+            server_args.push(f);
+        }
+        if let Some(b) = bit_rate.as_deref() {
+            server_args.push(b);
         }
         let log = self.cfg.sdk_root.join(".scrcpy-server.log");
         let child = spawn_detached(

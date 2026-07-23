@@ -16,6 +16,36 @@ use crate::{AdbService, SdkConfig};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What an APK says about itself — the details an installer shows before
+/// anything is written or installed.
+#[derive(Debug, Clone)]
+pub struct ApkInfo {
+    pub label: String,
+    pub package: String,
+    pub version: String,
+    pub min_sdk: String,
+    pub size_bytes: u64,
+}
+
+/// Read identity + details from an APK without touching anything (fast: one
+/// `aapt2 dump badging` + a stat).
+pub fn inspect(cfg: &SdkConfig, apk: &Path) -> Result<ApkInfo> {
+    if !apk.exists() {
+        return Err(EngineError::ApkNotFound(apk.display().to_string()));
+    }
+    let apk_str = apk.display().to_string();
+    let badging = run_capture(&cfg.aapt2(), &["dump", "badging", &apk_str])?;
+    let package = extract(&badging, "package: name='")
+        .ok_or_else(|| EngineError::PackageUnresolved(apk.display().to_string()))?;
+    let label = extract(&badging, "application-label:'")
+        .or_else(|| extract(&badging, "application-label-en:'"))
+        .unwrap_or_else(|| package.clone());
+    let version = extract(&badging, "versionName='").unwrap_or_else(|| "?".into());
+    let min_sdk = extract(&badging, "sdkVersion:'").unwrap_or_else(|| "?".into());
+    let size_bytes = std::fs::metadata(apk).map(|m| m.len()).unwrap_or(0);
+    Ok(ApkInfo { label, package, version, min_sdk, size_bytes })
+}
+
 pub struct AppifyOutcome {
     pub label: String,
     pub package: String,

@@ -10,6 +10,7 @@ mod app;
 #[cfg(target_os = "macos")]
 mod avlayer;
 mod input;
+mod keymap;
 mod ui;
 mod video;
 
