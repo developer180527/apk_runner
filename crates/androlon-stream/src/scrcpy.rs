@@ -27,6 +27,11 @@ const CONFIG_FLAG: u64 = 1 << 62;
 const KEYFRAME_FLAG: u64 = 1 << 61;
 const PTS_MASK: u64 = (1 << 61) - 1;
 const DEVICE_SOCKET: &str = "/data/local/tmp/scrcpy-server.jar";
+const AUDIO_CODEC_RAW: u32 = 0x0072_6177; // "\0raw"
+
+/// scrcpy raw-audio stream parameters (fixed by the protocol).
+pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: u32 = 2;
 
 pub struct ScrcpyOptions {
     /// Local path to the `scrcpy-server` binary to push to the device.
@@ -49,6 +54,10 @@ pub struct ScrcpyOptions {
     /// Open the control channel (input injection). The server then expects a
     /// second connection on the same tunnel; `start()` makes it.
     pub control: bool,
+    /// Capture device audio as raw PCM (48 kHz stereo s16le — no decoder
+    /// needed). Device-wide, so enable it on ONE pane only; scrcpy's playback
+    /// capture takes the audio over (it stops playing on the device side).
+    pub audio: bool,
     /// Coherence: create a fresh virtual display of this size and capture it
     /// instead of `display_id`. Each app pane gets its own display, sized by
     /// us — so its window is always pixel-exact, never letterboxed.
@@ -84,6 +93,7 @@ impl Default for ScrcpyOptions {
             video_bit_rate: 0,
             display_id: 0,
             control: true,
+            audio: false,
             new_display: None,
             new_display_dpi: None,
             start_app: None,
@@ -130,9 +140,12 @@ impl ScrcpyClient {
     }
 
     /// Set up the forward tunnel, launch the server, connect, and read metadata.
-    /// With `control` on, a second connection on the same tunnel becomes the
-    /// input-injection channel (the server accepts video first, then control).
-    pub fn start(&mut self) -> Result<(VideoStream, Option<ControlChannel>)> {
+    /// The server accepts one connection per enabled socket, strictly in the
+    /// order video → audio → control; we connect the same way (dummy byte on
+    /// the first socket only).
+    pub fn start(
+        &mut self,
+    ) -> Result<(VideoStream, Option<AudioStream>, Option<ControlChannel>)> {
         // Probe for a free local port: the in-process counter can't see other
         // Androlon processes (each appified .app is its own process), but a
         // port held by one — or by an active adb forward — fails the bind.
@@ -170,6 +183,8 @@ impl ScrcpyClient {
         // same tunnel before proceeding; we make it below, right after the
         // video socket's dummy byte proves the server is up.
         let control = format!("control={}", self.opts.control);
+        // Raw PCM: SDL plays it directly, no audio decoder anywhere.
+        let audio_arg = if self.opts.audio { "audio=true" } else { "audio=false" };
         let server_args: Vec<&str> = vec![
             "shell",
             "CLASSPATH=/data/local/tmp/scrcpy-server.jar",
@@ -178,7 +193,7 @@ impl ScrcpyClient {
             "com.genymobile.scrcpy.Server",
             &ver,
             "tunnel_forward=true",
-            "audio=false",
+            audio_arg,
             &control,
             "cleanup=true",
             "video_codec=h264",
@@ -191,6 +206,9 @@ impl ScrcpyClient {
             &display,
         ];
         let mut server_args = server_args;
+        if self.opts.audio {
+            server_args.push("audio_codec=raw");
+        }
         if let Some(d) = decorations.as_deref() {
             server_args.push(d);
         }
@@ -214,9 +232,16 @@ impl ScrcpyClient {
         // The server needs a moment to create the abstract socket.
         let stream = connect_retry(self.opts.port, 50, Duration::from_millis(100))?;
 
-        // Control socket: second connect, no dummy byte (that was video-only).
-        // Must happen before read_meta — the server only proceeds to the
+        // Audio socket (second connect, no dummy byte). Must precede the
+        // control connect and read_meta — the server only proceeds to the
         // handshake once every expected socket is connected.
+        let audio = if self.opts.audio {
+            let a = TcpStream::connect(("127.0.0.1", self.opts.port))?;
+            Some(a)
+        } else {
+            None
+        };
+
         let mut control = if self.opts.control {
             let ctl = TcpStream::connect(("127.0.0.1", self.opts.port))?;
             Some(ControlChannel::new(ctl))
@@ -225,6 +250,22 @@ impl ScrcpyClient {
         };
 
         let meta = read_meta(&stream)?;
+
+        // Audio handshake: a 4-byte codec id ("\0raw" for PCM).
+        let audio = match audio {
+            Some(mut a) => {
+                let mut codec_buf = [0u8; 4];
+                a.read_exact(&mut codec_buf)?;
+                let codec = u32::from_be_bytes(codec_buf);
+                if codec != AUDIO_CODEC_RAW {
+                    return Err(StreamError::Protocol(format!(
+                        "expected raw audio codec, got 0x{codec:08x}"
+                    )));
+                }
+                Some(AudioStream { stream: a })
+            }
+            None => None,
+        };
 
         // Coherence: ask the server to launch the app on this connection's
         // display. After the handshake — the server processes control messages
@@ -240,7 +281,7 @@ impl ScrcpyClient {
             }
         }
 
-        Ok((VideoStream { stream, meta }, control))
+        Ok((VideoStream { stream, meta }, audio, control))
     }
 
     pub fn stop(&mut self) {
@@ -312,6 +353,24 @@ fn read_meta(mut stream: &TcpStream) -> Result<StreamMeta> {
     let height = u32::from_be_bytes(session[8..12].try_into().unwrap());
 
     Ok(StreamMeta { device_name, codec, width, height })
+}
+
+/// A connected raw-PCM audio stream (48 kHz stereo s16le). Packets use the
+/// same 12-byte header framing as video; the payload is playable directly.
+pub struct AudioStream {
+    stream: TcpStream,
+}
+
+impl AudioStream {
+    /// Read the next PCM chunk.
+    pub fn read_chunk(&mut self) -> Result<Vec<u8>> {
+        let mut header = [0u8; 12];
+        self.stream.read_exact(&mut header)?;
+        let len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+        let mut data = vec![0u8; len];
+        self.stream.read_exact(&mut data)?;
+        Ok(data)
+    }
 }
 
 /// A connected video stream. Call `read_packet` in a loop.

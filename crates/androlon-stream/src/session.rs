@@ -68,6 +68,20 @@ where
     SampleFeed { _handle: handle }
 }
 
+/// Audio feeder: reads raw PCM chunks off the audio socket and hands each to
+/// `sink` (which pushes into the host audio API). Ends when the stream closes.
+pub fn spawn_audio<F>(mut stream: crate::scrcpy::AudioStream, mut sink: F) -> JoinHandle<()>
+where
+    F: FnMut(&[u8]) + Send + 'static,
+{
+    thread::spawn(move || loop {
+        match stream.read_chunk() {
+            Ok(chunk) => sink(&chunk),
+            Err(_) => break,
+        }
+    })
+}
+
 /// Spawn the decode loop. The OpenH264 decoder is created *inside* the thread
 /// (it isn't `Send`), so only the `PacketSource` must cross the boundary.
 pub fn spawn_decode<S: PacketSource + 'static>(mut source: S) -> FrameStream {

@@ -81,7 +81,7 @@ fn cmd_scrcpy_probe(cfg: &SdkConfig) -> androlon_core::Result<()> {
         fail(&format!("deploy failed: {e}"));
     }
     println!("› starting stream (forward tunnel + app_process)…");
-    let (mut stream, control) = match client.start() {
+    let (mut stream, _audio, control) = match client.start() {
         Ok(s) => s,
         Err(e) => fail(&format!("start failed: {e}\n(check {}/.scrcpy-server.log on device side)", cfg.sdk_root.display())),
     };

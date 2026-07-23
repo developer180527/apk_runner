@@ -36,10 +36,28 @@ pub struct JoystickCfg {
     pub pointer: u64,
 }
 
+/// Shooter-style mouse-look: while captured (F10 toggles), relative mouse
+/// motion drags a persistent "aim finger" anchored at (cx, cy); when the drag
+/// nears the screen edge the finger silently lifts and re-anchors.
+/// `sensitivity` = stream pixels per mouse count.
+#[derive(Debug, Clone, Copy)]
+pub struct AimCfg {
+    pub cx: f32,
+    pub cy: f32,
+    pub sensitivity: f32,
+}
+
 #[derive(Debug, Default)]
 pub struct Keymap {
     bindings: HashMap<Keycode, Action>,
     pub joystick: Option<JoystickCfg>,
+    pub aim: Option<AimCfg>,
+    /// While mouse-look is captured, left click taps here (the game's fire
+    /// button) instead of wherever the hidden cursor happens to be.
+    pub fire: Option<(f32, f32)>,
+    /// Key that toggles mouse-look capture. Default: ` (backquote) — the
+    /// function row needs Fn on Mac laptops, so F-keys make poor defaults.
+    pub capture: Option<Keycode>,
 }
 
 impl Keymap {
@@ -52,7 +70,7 @@ impl Keymap {
             .join(format!("{package}.conf"));
         let text = std::fs::read_to_string(path).ok()?;
         let map = Self::parse(&text);
-        (!map.bindings.is_empty()).then_some(map)
+        (!map.bindings.is_empty() || map.aim.is_some() || map.fire.is_some()).then_some(map)
     }
 
     pub fn parse(text: &str) -> Keymap {
@@ -73,6 +91,24 @@ impl Keymap {
                     };
                     map.bindings.insert(key, Action::Tap { x, y, pointer: next_pointer });
                     next_pointer += 1;
+                }
+                ["aim", cx, cy, sens] => {
+                    let (Ok(cx), Ok(cy), Ok(sensitivity)) = (cx.parse(), cy.parse(), sens.parse())
+                    else {
+                        continue;
+                    };
+                    map.aim = Some(AimCfg { cx, cy, sensitivity });
+                }
+                ["capture", key] => {
+                    if let Some(key) = keycode(key) {
+                        map.capture = Some(key);
+                    }
+                }
+                ["fire", x, y] => {
+                    let (Ok(x), Ok(y)) = (x.parse(), y.parse()) else {
+                        continue;
+                    };
+                    map.fire = Some((x, y));
                 }
                 ["joystick", up, left, down, right, cx, cy, r] => {
                     let keys = [keycode(up), keycode(left), keycode(down), keycode(right)];
@@ -95,6 +131,11 @@ impl Keymap {
 
     pub fn get(&self, key: Keycode) -> Option<Action> {
         self.bindings.get(&key).copied()
+    }
+
+    /// The effective capture-toggle key (configured or the default `` ` ``).
+    pub fn capture_key(&self) -> Keycode {
+        self.capture.unwrap_or(Keycode::Grave)
     }
 }
 
@@ -172,6 +213,14 @@ mod tests {
             panic!("taps missing")
         };
         assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn parses_aim_and_fire() {
+        let map = Keymap::parse("aim 0.65 0.4 2.0\nfire 0.93 0.65\n");
+        let aim = map.aim.unwrap();
+        assert!((aim.sensitivity - 2.0).abs() < 1e-6);
+        assert_eq!(map.fire, Some((0.93, 0.65)));
     }
 
     #[test]

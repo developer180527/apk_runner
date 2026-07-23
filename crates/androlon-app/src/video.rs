@@ -134,6 +134,14 @@ impl VideoWindow {
     pub fn id(&self) -> u32 {
         self.window.id()
     }
+
+    pub fn raw(&self) -> *mut sdl3_sys::video::SDL_Window {
+        self.window.raw()
+    }
+
+    pub fn set_title(&mut self, title: &str) {
+        let _ = self.window.set_title(title);
+    }
 }
 
 /// A moving gradient, so `--video-demo` can prove the upload+blit path before a

@@ -92,7 +92,7 @@ fn use_avlayer() -> bool {
 /// Mirror the device's main display (the "phone in a window" pane).
 fn open_live_surface(video: &VideoSubsystem, cfg: &SdkConfig) -> Result<VideoPane, String> {
     let opts = ScrcpyOptions { max_size: 1024, ..ScrcpyOptions::default() };
-    open_stream_pane(video, cfg, opts, None)
+    open_stream_pane(video, cfg, opts, None, None)
 }
 
 /// Coherence: give `package` its own Android virtual display and present it as
@@ -102,6 +102,9 @@ fn open_coherence_surface(
     cfg: &SdkConfig,
     package: &str,
     decorations: bool,
+    // Some = play device audio through this host subsystem. Audio capture is
+    // device-wide, so exactly one pane should have it (the single-app pane).
+    sound: Option<&sdl3::AudioSubsystem>,
 ) -> Result<VideoPane, String> {
     // Size is in *window points* (default 800x500). The virtual display is
     // created at 2x pixels with a matching 2x Android density (320 = 2x mdpi),
@@ -127,9 +130,10 @@ fn open_coherence_surface(
         // (localhost, so bandwidth is free — artifacts aren't).
         max_fps: env_u32("ANDROLON_FPS", 60),
         video_bit_rate: env_u32("ANDROLON_BITRATE", 16_000_000),
+        audio: sound.is_some(),
         ..ScrcpyOptions::default()
     };
-    open_stream_pane(video, cfg, opts, Some((package, (ww, wh))))
+    open_stream_pane(video, cfg, opts, Some((package, (ww, wh))), sound)
 }
 
 fn open_stream_pane(
@@ -138,13 +142,44 @@ fn open_stream_pane(
     mut opts: ScrcpyOptions,
     // Coherence: (package, window size in points). None = mirror pane.
     app: Option<(&str, (u32, u32))>,
+    sound: Option<&sdl3::AudioSubsystem>,
 ) -> Result<VideoPane, String> {
     if let Ok(path) = std::env::var("ANDROLON_SCRCPY_SERVER") {
         opts.server_jar = path.into();
     }
     let mut client = ScrcpyClient::new(cfg.clone(), opts);
     client.deploy_server().map_err(|e| format!("deploy server: {e}"))?;
-    let (stream, ctl) = client.start().map_err(|e| format!("start stream: {e}"))?;
+    let (stream, audio, ctl) = client.start().map_err(|e| format!("start stream: {e}"))?;
+
+    // Device audio → SDL playback. Raw PCM (48 kHz stereo s16le), pushed by a
+    // feeder thread; the thread (and the device it owns) ends with the socket.
+    if let (Some(audio), Some(sound)) = (audio, sound) {
+        use sdl3::audio::{AudioFormat, AudioSpec};
+        let spec = AudioSpec {
+            freq: Some(androlon_stream::scrcpy::AUDIO_SAMPLE_RATE as i32),
+            channels: Some(androlon_stream::scrcpy::AUDIO_CHANNELS as i32),
+            format: Some(AudioFormat::S16LE),
+        };
+        let out = sound
+            .default_playback_device()
+            .open_device_stream(Some(&spec))
+            .map_err(|e| format!("audio device: {e}"))?;
+        let _ = out.resume();
+        // SDL audio streams are internally locked; pushing from the feeder
+        // thread is safe even though the handle type isn't marked Send. The
+        // method (vs. field access) makes the closure capture the whole
+        // wrapper, so the unsafe Send actually applies (2021 disjoint capture).
+        struct SendAudio(sdl3::audio::AudioStreamOwner);
+        unsafe impl Send for SendAudio {}
+        impl SendAudio {
+            fn put(&self, chunk: &[u8]) {
+                let _ = self.0.put_data(chunk);
+            }
+        }
+        let out = SendAudio(out);
+        let _ = androlon_stream::spawn_audio(audio, move |chunk| out.put(chunk));
+        println!("✓ audio: device playback → host output");
+    }
 
     // Game keybindings, if the user wrote a profile for this package.
     let keymap = app.and_then(|(pkg, _)| {
@@ -192,22 +227,35 @@ fn open_stream_pane(
         let id = window.id();
         // Stream size shared with the input path (updates on rotation).
         let size = Arc::new(AtomicU64::new(pack_size(mw, mh)));
+        let frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let feed = {
             let present = Arc::clone(&present);
             let size = Arc::clone(&size);
+            let frames = Arc::clone(&frames);
             androlon_stream::spawn_samples(stream, move |sample, (w, h)| {
                 size.store(pack_size(w, h), Ordering::Relaxed);
                 present.enqueue(&sample);
+                frames.fetch_add(1, Ordering::Relaxed);
             })
         };
         return Ok(VideoPane {
-            screen: Screen::Layer { window, _present: present, size, _feed: feed, _client: client },
+            screen: Screen::Layer {
+                window,
+                _present: present,
+                size,
+                frames,
+                _feed: feed,
+                _client: client,
+            },
             id,
             control: ctl,
             stream_size: (mw, mh),
             touch_down: false,
             keymap,
             joy: JoyState::default(),
+            aim: AimState::default(),
+            title,
+            hud_t: std::time::Instant::now(),
         });
     }
 
@@ -227,6 +275,9 @@ fn open_stream_pane(
         touch_down: false,
         keymap,
         joy: JoyState::default(),
+        aim: AimState::default(),
+        title,
+        hud_t: std::time::Instant::now(),
     })
 }
 
@@ -281,6 +332,8 @@ enum Screen {
         _present: std::sync::Arc<crate::avlayer::AvLayerPresenter>,
         /// Packed (w << 32 | h), written by the stream thread on rotation.
         size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// Frames enqueued since the HUD last sampled (fps counter).
+        frames: std::sync::Arc<std::sync::atomic::AtomicU32>,
         _feed: androlon_stream::SampleFeed,
         /// Keeps the scrcpy server + tunnel alive for the pane's lifetime.
         _client: ScrcpyClient,
@@ -303,6 +356,42 @@ impl Screen {
             Screen::Layer { window, .. } => window.size(),
         }
     }
+
+    fn raw_window(&self) -> *mut sdl3_sys::video::SDL_Window {
+        match self {
+            Screen::Gpu { window, .. } => window.raw(),
+            #[cfg(target_os = "macos")]
+            Screen::Layer { window, .. } => window.raw(),
+        }
+    }
+
+    /// Capture/release the mouse for shooter-style aiming (relative motion,
+    /// hidden cursor).
+    fn set_relative_mouse(&self, on: bool) {
+        unsafe { sdl3_sys::mouse::SDL_SetWindowRelativeMouseMode(self.raw_window(), on) };
+    }
+
+    fn set_title(&mut self, title: &str) {
+        match self {
+            Screen::Gpu { window, .. } => window.set_title(title),
+            #[cfg(target_os = "macos")]
+            Screen::Layer { window, .. } => {
+                let _ = window.set_title(title);
+            }
+        }
+    }
+}
+
+/// Pointer ids for shooter mode (distinct from tap bindings 1.. and stick 0).
+const AIM_POINTER: u64 = 100;
+const FIRE_POINTER: u64 = 101;
+
+/// Mouse-look state: the aim finger's current drag offset in stream pixels.
+#[derive(Default)]
+struct AimState {
+    captured: bool,
+    down: bool,
+    off: (f32, f32),
 }
 
 struct VideoPane {
@@ -318,6 +407,11 @@ struct VideoPane {
     /// Game keybindings (keys → synthetic touches); None = plain keyboard.
     keymap: Option<Keymap>,
     joy: JoyState,
+    /// Mouse-look (shooter mode) state; active only with an `aim` binding.
+    aim: AimState,
+    /// Base window title (the fps HUD appends to it).
+    title: String,
+    hud_t: std::time::Instant,
 }
 
 impl VideoPane {
@@ -339,6 +433,43 @@ impl VideoPane {
             return;
         }
         match *event {
+            // Shooter mode: the capture key (default `, configurable via a
+            // `capture` line) toggles mouse-look. Needs an `aim` binding.
+            Event::KeyDown { keycode: Some(key), repeat: false, .. }
+                if self
+                    .keymap
+                    .as_ref()
+                    .is_some_and(|m| m.aim.is_some() && m.capture_key() == key) =>
+            {
+                if self.aim.captured {
+                    self.release_capture();
+                } else {
+                    self.aim.captured = true;
+                    self.screen.set_relative_mouse(true);
+                }
+            }
+            // Captured: relative motion drags the aim finger.
+            Event::MouseMotion { xrel, yrel, .. } if self.aim.captured => {
+                self.aim_move(xrel, yrel);
+            }
+            // Captured: left click taps the game's fire button.
+            Event::MouseButtonDown { mouse_btn: MouseButton::Left, .. } if self.aim.captured => {
+                if let Some((fx, fy)) = self.keymap.as_ref().and_then(|m| m.fire) {
+                    let pos = self.norm_pos(fx, fy);
+                    let msg = control::touch_event(
+                        control::ACTION_DOWN, FIRE_POINTER, pos, 1.0, 0, 0,
+                    );
+                    let _ = self.control.as_mut().unwrap().send(&msg);
+                }
+            }
+            Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } if self.aim.captured => {
+                if let Some((fx, fy)) = self.keymap.as_ref().and_then(|m| m.fire) {
+                    let pos = self.norm_pos(fx, fy);
+                    let msg =
+                        control::touch_event(control::ACTION_UP, FIRE_POINTER, pos, 0.0, 0, 0);
+                    let _ = self.control.as_mut().unwrap().send(&msg);
+                }
+            }
             Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
                 self.touch_down = true;
                 let pos = self.pos_at(x, y);
@@ -399,7 +530,89 @@ impl VideoPane {
                     let _ = ctl.send_key(control::ACTION_UP, ak, input::meta_of(keymod));
                 }
             }
+            // Losing focus (Cmd-Tab etc.) always releases shooter capture.
+            Event::Window { win_event: WindowEvent::FocusLost, .. } => {
+                self.release_capture();
+            }
             _ => {}
+        }
+    }
+
+    fn norm_pos(&self, nx: f32, ny: f32) -> Position {
+        let (sw, sh) = self.stream_size;
+        Position {
+            x: (nx * sw as f32) as i32,
+            y: (ny * sh as f32) as i32,
+            width: sw as u16,
+            height: sh as u16,
+        }
+    }
+
+    /// Leave shooter mode, lifting the aim finger if it's down.
+    fn release_capture(&mut self) {
+        if !self.aim.captured {
+            return;
+        }
+        if self.aim.down {
+            if let Some(cfg) = self.keymap.as_ref().and_then(|m| m.aim) {
+                let (ox, oy) = self.aim.off;
+                let (sw, sh) = self.stream_size;
+                let pos = Position {
+                    x: ((cfg.cx * sw as f32 + ox) as i32).clamp(0, sw as i32 - 1),
+                    y: ((cfg.cy * sh as f32 + oy) as i32).clamp(0, sh as i32 - 1),
+                    width: sw as u16,
+                    height: sh as u16,
+                };
+                let msg = control::touch_event(control::ACTION_UP, AIM_POINTER, pos, 0.0, 0, 0);
+                if let Some(ctl) = self.control.as_mut() {
+                    let _ = ctl.send(&msg);
+                }
+            }
+        }
+        self.aim = AimState::default();
+        self.screen.set_relative_mouse(false);
+    }
+
+    /// One relative mouse step in shooter mode: move the aim finger, silently
+    /// re-anchoring (lift + re-press at center) when it nears the edge.
+    fn aim_move(&mut self, xrel: f32, yrel: f32) {
+        let Some(cfg) = self.keymap.as_ref().and_then(|m| m.aim) else {
+            return;
+        };
+        let (sw, sh) = (self.stream_size.0 as f32, self.stream_size.1 as f32);
+        let anchor = (cfg.cx * sw, cfg.cy * sh);
+        let ctl_pos = |x: f32, y: f32, sw: f32, sh: f32| Position {
+            x: (x as i32).clamp(0, sw as i32 - 1),
+            y: (y as i32).clamp(0, sh as i32 - 1),
+            width: sw as u16,
+            height: sh as u16,
+        };
+
+        if !self.aim.down {
+            self.aim.down = true;
+            self.aim.off = (0.0, 0.0);
+            let msg = control::touch_event(
+                control::ACTION_DOWN, AIM_POINTER,
+                ctl_pos(anchor.0, anchor.1, sw, sh), 1.0, 0, 0,
+            );
+            let _ = self.control.as_mut().unwrap().send(&msg);
+        }
+        self.aim.off.0 += xrel * cfg.sensitivity;
+        self.aim.off.1 += yrel * cfg.sensitivity;
+        let (x, y) = (anchor.0 + self.aim.off.0, anchor.1 + self.aim.off.1);
+        let msg = control::touch_event(
+            control::ACTION_MOVE, AIM_POINTER, ctl_pos(x, y, sw, sh), 1.0, 0, 0,
+        );
+        let _ = self.control.as_mut().unwrap().send(&msg);
+
+        // Near an edge → lift and re-anchor so the next motion starts fresh.
+        if x < sw * 0.05 || x > sw * 0.95 || y < sh * 0.05 || y > sh * 0.95 {
+            let msg = control::touch_event(
+                control::ACTION_UP, AIM_POINTER, ctl_pos(x, y, sw, sh), 0.0, 0, 0,
+            );
+            let _ = self.control.as_mut().unwrap().send(&msg);
+            self.aim.down = false;
+            self.aim.off = (0.0, 0.0);
         }
     }
 
@@ -435,8 +648,16 @@ impl VideoPane {
                 let msg = match (self.joy.direction(), self.joy.down) {
                     (Some((jx, jy)), false) => {
                         self.joy.down = true;
+                        // Engage like a thumb: touch DOWN at the stick center,
+                        // then slide outward. A DOWN landing directly at the
+                        // deflected position can fall outside the stick's hit
+                        // zone and be read as a camera swipe instead.
+                        let center = at(cfg.cx, cfg.cy);
+                        let down =
+                            control::touch_event(control::ACTION_DOWN, cfg.pointer, center, 1.0, 0, 0);
+                        let _ = self.control.as_mut().unwrap().send(&down);
                         let pos = at(cfg.cx + jx * cfg.radius, cfg.cy + jy * cfg.radius);
-                        control::touch_event(control::ACTION_DOWN, cfg.pointer, pos, 1.0, 0, 0)
+                        control::touch_event(control::ACTION_MOVE, cfg.pointer, pos, 1.0, 0, 0)
                     }
                     (Some((jx, jy)), true) => {
                         let pos = at(cfg.cx + jx * cfg.radius, cfg.cy + jy * cfg.radius);
@@ -464,7 +685,9 @@ pub fn run_single(package: &str) {
     let video = sdl.video().expect("SDL video subsystem");
     let cfg = SdkConfig::from_env();
 
-    let mut pane = match open_coherence_surface(&video, &cfg, package, false) {
+    // The single-app pane owns the device audio (capture is device-wide).
+    let sound = sdl.audio().ok();
+    let mut pane = match open_coherence_surface(&video, &cfg, package, false, sound.as_ref()) {
         Ok(pane) => pane,
         Err(e) => {
             eprintln!("✗ {package}: {e}");
@@ -483,7 +706,8 @@ pub fn run_single(package: &str) {
             }
         }
 
-        let VideoPane { screen, stream_size, .. } = &mut pane;
+        let VideoPane { screen, stream_size, title, hud_t, .. } = &mut pane;
+        let mut hud_fps: Option<u32> = None;
         match screen {
             Screen::Gpu { window, source } => {
                 if let Some(frame) = source.next_frame() {
@@ -492,9 +716,16 @@ pub fn run_single(package: &str) {
                 }
             }
             #[cfg(target_os = "macos")]
-            Screen::Layer { size, .. } => {
+            Screen::Layer { size, frames, .. } => {
                 *stream_size = unpack_size(size.load(std::sync::atomic::Ordering::Relaxed));
+                if hud_t.elapsed() >= std::time::Duration::from_secs(1) {
+                    *hud_t = std::time::Instant::now();
+                    hud_fps = Some(frames.swap(0, std::sync::atomic::Ordering::Relaxed));
+                }
             }
+        }
+        if let Some(fps) = hud_fps {
+            screen.set_title(&format!("{title} — {fps} fps"));
         }
 
         // Frames bypass this loop (stream thread → layer); it only services
@@ -545,6 +776,9 @@ pub fn run() {
                 touch_down: false,
                 keymap: None,
                 joy: JoyState::default(),
+                aim: AimState::default(),
+                title: "Androlon — App surface".into(),
+                hud_t: std::time::Instant::now(),
             });
         }
     }
@@ -564,7 +798,7 @@ pub fn run() {
     // e.g. ANDROLON_COHERENCE=com.android.settings (comma-separate for several).
     if let Ok(pkgs) = std::env::var("ANDROLON_COHERENCE") {
         for pkg in pkgs.split(',').filter(|p| !p.is_empty()) {
-            match open_coherence_surface(&video, &cfg, pkg, true) {
+            match open_coherence_surface(&video, &cfg, pkg, true, None) {
                 Ok(pane) => {
                     println!("✓ coherence window for {pkg} (id {})", pane.id);
                     panes.push(pane);
@@ -606,6 +840,7 @@ pub fn run() {
                 | Event::MouseWheel { window_id, .. }
                 | Event::KeyDown { window_id, .. }
                 | Event::KeyUp { window_id, .. }
+                | Event::Window { window_id, win_event: WindowEvent::FocusLost, .. }
                     if window_id != mgmt_id =>
                 {
                     if let Some(pane) = panes.iter_mut().find(|p| p.id == window_id) {
@@ -647,6 +882,9 @@ pub fn run() {
                         touch_down: false,
                         keymap: None,
                         joy: JoyState::default(),
+                        aim: AimState::default(),
+                        title: "Androlon — App surface".into(),
+                        hud_t: std::time::Instant::now(),
                     }),
                     None => app.log_line("✗ could not start decoder for app surface"),
                 },
@@ -667,7 +905,8 @@ pub fn run() {
 
         // Present each app-surface window.
         for pane in &mut panes {
-            let VideoPane { screen, stream_size, .. } = pane;
+            let VideoPane { screen, stream_size, title, hud_t, .. } = pane;
+            let mut hud_fps: Option<u32> = None;
             match screen {
                 Screen::Gpu { window, source } => {
                     if let Some(frame) = source.next_frame() {
@@ -676,11 +915,18 @@ pub fn run() {
                     }
                 }
                 // Frames are enqueued by the stream thread; just refresh the
-                // size the input path scales against.
+                // size the input path scales against (and sample the fps HUD).
                 #[cfg(target_os = "macos")]
-                Screen::Layer { size, .. } => {
+                Screen::Layer { size, frames, .. } => {
                     *stream_size = unpack_size(size.load(std::sync::atomic::Ordering::Relaxed));
+                    if hud_t.elapsed() >= std::time::Duration::from_secs(1) {
+                        *hud_t = std::time::Instant::now();
+                        hud_fps = Some(frames.swap(0, std::sync::atomic::Ordering::Relaxed));
+                    }
                 }
+            }
+            if let Some(fps) = hud_fps {
+                screen.set_title(&format!("{title} — {fps} fps"));
             }
         }
 

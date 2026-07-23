@@ -19,7 +19,7 @@ pub use decode::{make_decoder, DecoderKind, NullDecoder, Openh264Decoder, VideoD
 pub use encode::TestEncoder;
 pub use error::{Result, StreamError};
 pub use model::{Codec, DecodedFrame, EncodedPacket, StreamMeta};
-pub use scrcpy::{ScrcpyClient, ScrcpyOptions, VideoStream};
-pub use session::{spawn_decode, FrameStream, PacketSource};
+pub use scrcpy::{AudioStream, ScrcpyClient, ScrcpyOptions, VideoStream};
+pub use session::{spawn_audio, spawn_decode, FrameStream, PacketSource};
 #[cfg(target_os = "macos")]
 pub use session::{spawn_samples, SampleFeed};
