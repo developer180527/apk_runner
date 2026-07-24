@@ -136,7 +136,20 @@ fn open_coherence_surface(
         audio: sound.is_some(),
         ..ScrcpyOptions::default()
     };
-    open_stream_pane(video, cfg, opts, Some((package, (ww, wh))), sound, lease)
+    open_stream_pane(
+        video,
+        cfg,
+        opts,
+        Some((package, (ww, wh))),
+        sound,
+        lease,
+        Some(Respawn {
+            cfg: cfg.clone(),
+            package: package.to_string(),
+            decorations,
+            audio: sound.is_some(),
+        }),
+    )
 }
 
 fn open_stream_pane(
@@ -148,6 +161,7 @@ fn open_stream_pane(
     sound: Option<&sdl3::AudioSubsystem>,
     // Runtime lease to hand to the pane (kept alive for its lifetime).
     lease: Option<androlon_ipc::RuntimeLease>,
+    respawn: Option<Respawn>,
 ) -> Result<VideoPane, String> {
     if let Ok(path) = std::env::var("ANDROLON_SCRCPY_SERVER") {
         opts.server_jar = path.into();
@@ -266,6 +280,8 @@ fn open_stream_pane(
             title,
             hud_t: std::time::Instant::now(),
             _lease: lease,
+            respawn,
+            pending_resize: None,
         });
     }
 
@@ -289,6 +305,8 @@ fn open_stream_pane(
         title,
         hud_t: std::time::Instant::now(),
         _lease: lease,
+        respawn,
+        pending_resize: None,
     })
 }
 
@@ -386,9 +404,90 @@ struct VideoPane {
     hud_t: std::time::Instant,
     /// Holds the runtime daemon's boot lease while this pane is open.
     _lease: Option<androlon_ipc::RuntimeLease>,
+    /// What this pane is showing, so its stream can be rebuilt at a new size.
+    /// `None` for mirror panes, which track the device's own display.
+    respawn: Option<Respawn>,
+    /// Window size seen at the last resize event, and when. The stream is
+    /// only rebuilt once resizing has settled — a virtual display can't be
+    /// resized in place, so each rebuild is a reconnect.
+    pending_resize: Option<(std::time::Instant, u32, u32)>,
 }
 
+/// Everything needed to re-create a Coherence stream at a different size.
+struct Respawn {
+    cfg: SdkConfig,
+    package: String,
+    decorations: bool,
+    audio: bool,
+}
+
+/// How long the window must sit still before we reconnect. Long enough that
+/// a drag doesn't spawn a stream per frame, short enough to feel immediate.
+const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(450);
+
 impl VideoPane {
+    /// Note a resize; the reconnect happens once the window settles.
+    fn note_resize(&mut self, w: u32, h: u32) {
+        if self.respawn.is_some() {
+            self.pending_resize = Some((std::time::Instant::now(), w, h));
+        }
+    }
+
+    /// If resizing has settled, rebuild the stream so Android renders at the
+    /// window's true resolution instead of being upscaled into it.
+    ///
+    /// A `new_display` virtual display cannot be resized in place, so this is
+    /// a full reconnect: new server, new display, same window and same
+    /// CoreAnimation layer (the layer is what makes this invisible — the last
+    /// frame stays on screen while the new stream comes up).
+    fn maybe_rebuild(&mut self) {
+        let Some((at, w, h)) = self.pending_resize else { return };
+        if at.elapsed() < RESIZE_SETTLE {
+            return;
+        }
+        self.pending_resize = None;
+        let Some(respawn) = self.respawn.as_ref() else { return };
+
+        // Retina-exact, as at first open: display pixels = 2x window points.
+        let opts = ScrcpyOptions {
+            new_display: Some((w * 2, h * 2)),
+            new_display_dpi: Some(env_u32("ANDROLON_COHERENCE_DPI", 320)),
+            start_app: Some(respawn.package.clone()),
+            vd_system_decorations: respawn.decorations,
+            max_fps: env_u32("ANDROLON_FPS", 60),
+            video_bit_rate: env_u32("ANDROLON_BITRATE", 16_000_000),
+            // Audio belongs to the pane's original stream; re-requesting it
+            // would fight the still-running one for device capture.
+            audio: false,
+            ..ScrcpyOptions::default()
+        };
+        let mut client = ScrcpyClient::new(respawn.cfg.clone(), opts);
+        if client.deploy_server().is_err() {
+            return; // keep the current stream rather than dropping to nothing
+        }
+        let Ok((stream, _audio, control)) = client.start() else { return };
+
+        #[cfg(target_os = "macos")]
+        if let Screen::Layer { _present, size, frames, _feed, _client, .. } = &mut self.screen {
+            use std::sync::atomic::Ordering;
+            let (mw, mh) = (stream.meta().width, stream.meta().height);
+            size.store(pack_size(mw, mh), Ordering::Relaxed);
+            let present = std::sync::Arc::clone(_present);
+            let size = std::sync::Arc::clone(size);
+            let frames = std::sync::Arc::clone(frames);
+            // Replacing the feed drops the old one, which closes its socket
+            // and ends the previous server — and with it the old display.
+            *_feed = androlon_stream::spawn_samples(stream, move |sample, (w, h)| {
+                size.store(pack_size(w, h), Ordering::Relaxed);
+                present.enqueue(&sample);
+                frames.fetch_add(1, Ordering::Relaxed);
+            });
+            *_client = client;
+            self.control = control;
+            self.stream_size = (mw, mh);
+        }
+    }
+
     fn pos_at(&self, x: f32, y: f32) -> Position {
         let (sx, sy) = input::window_to_stream((x, y), self.screen.window_size(), self.stream_size);
         Position {
@@ -679,9 +778,14 @@ pub fn run_single(package: &str) {
             match event {
                 Event::Quit { .. }
                 | Event::Window { win_event: WindowEvent::CloseRequested, .. } => break 'main,
+                Event::Window { win_event: WindowEvent::Resized(w, h), .. } => {
+                    pane.note_resize(w.max(1) as u32, h.max(1) as u32);
+                }
                 ref e => pane.handle_input(e),
             }
         }
+
+        pane.maybe_rebuild();
 
         let VideoPane { screen, stream_size, title, hud_t, .. } = &mut pane;
         let mut hud_fps: Option<u32> = None;
