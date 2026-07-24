@@ -42,9 +42,6 @@ mod mac {
     use objc2_foundation::{NSString, NSURL};
     use std::path::{Path, PathBuf};
 
-    // NSAlert returns 1000 for the first button, 1001 for the second, …
-    const FIRST_BUTTON: NSModalResponse = 1000;
-    const SECOND_BUTTON: NSModalResponse = 1001;
     const OK: NSModalResponse = 1;
 
     pub fn run() {
@@ -235,26 +232,6 @@ mod mac {
             panel.setAllowsMultipleSelection(false);
             panel.setMessage(Some(&NSString::from_str("Choose an APK to install")));
             panel.setPrompt(Some(&NSString::from_str("Choose")));
-            NSApplication::sharedApplication(mtm).activate();
-            if panel.runModal() != OK {
-                return None;
-            }
-            url_path(&panel.URL()?)
-        }
-    }
-
-    /// System folder picker for the destination.
-    fn choose_folder(mtm: MainThreadMarker, start: &Path) -> Option<PathBuf> {
-        unsafe {
-            let panel = NSOpenPanel::openPanel(mtm);
-            panel.setCanChooseFiles(false);
-            panel.setCanChooseDirectories(true);
-            panel.setCanCreateDirectories(true);
-            panel.setAllowsMultipleSelection(false);
-            panel.setMessage(Some(&NSString::from_str("Where should the app be created?")));
-            panel.setPrompt(Some(&NSString::from_str("Use Folder")));
-            let start = NSString::from_str(&start.display().to_string());
-            panel.setDirectoryURL(Some(&NSURL::fileURLWithPath(&start)));
             NSApplication::sharedApplication(mtm).activate();
             if panel.runModal() != OK {
                 return None;

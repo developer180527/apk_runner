@@ -12,19 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "androlon-app"
-version = "0.1.0"
-dependencies = [
- "androlon-core",
- "androlon-ipc",
- "androlon-stream",
- "dear-imgui-rs",
- "dear-imgui-sdl3",
- "sdl3",
- "sdl3-sys",
-]
-
-[[package]]
 name = "androlon-core"
 version = "0.1.0"
 
@@ -34,6 +21,17 @@ version = "0.1.0"
 dependencies = [
  "androlon-core",
  "androlon-stream",
+]
+
+[[package]]
+name = "androlon-hub"
+version = "0.1.0"
+dependencies = [
+ "androlon-core",
+ "androlon-ipc",
+ "dear-imgui-rs",
+ "dear-imgui-sdl3",
+ "sdl3",
 ]
 
 [[package]]
@@ -50,6 +48,17 @@ dependencies = [
 [[package]]
 name = "androlon-ipc"
 version = "0.1.0"
+
+[[package]]
+name = "androlon-player"
+version = "0.1.0"
+dependencies = [
+ "androlon-core",
+ "androlon-ipc",
+ "androlon-stream",
+ "sdl3",
+ "sdl3-sys",
+]
 
 [[package]]
 name = "androlon-runtimed"

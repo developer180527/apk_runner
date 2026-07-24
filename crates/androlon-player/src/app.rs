@@ -1,33 +1,21 @@
-//! Integrated multi-window shell: one SDL event loop drives the ImGui management
-//! window (SDLRenderer3) and any number of SDL_GPU "app surface" windows. Events
-//! are polled once at the low level, fed to ImGui, then converted to typed
-//! events and routed by `window_id`.
+//! The player's app surface: one Android virtual display streamed into a
+//! native window, with input, audio, and keymaps.
 //!
-//! Today each app-surface window is fed by a self-contained decode demo
-//! (encode→decode→present). Swapping `FrameProducer` for a scrcpy `FrameStream`
-//! is the only change needed to show a live Android display.
+//! Presentation has two paths — the macOS zero-copy AVSampleBufferDisplayLayer
+//! and the portable SDL_GPU upload+blit — selected by `ANDROLON_PRESENT`.
 
 use crate::input;
 use crate::keymap::{Action, JoyState, Keymap};
-use crate::ui::{AppState, LibraryRequest};
-use crate::video::{self, VideoWindow};
+use crate::video::VideoWindow;
 use androlon_core::SdkConfig;
 use androlon_stream::control::{self, keycodes, ControlChannel, Position};
-use androlon_stream::{
-    spawn_decode, DecodedFrame, FrameStream, Openh264Decoder, ScrcpyClient, ScrcpyOptions,
-    TestEncoder, VideoDecoder,
-};
-use dear_imgui_rs::Context;
-use dear_imgui_sdl3::{sdl3_poll_event_ll, Sdl3RendererBackend};
+use androlon_stream::{spawn_decode, DecodedFrame, FrameStream, ScrcpyClient, ScrcpyOptions};
 use sdl3::event::{Event, WindowEvent};
 use sdl3::mouse::MouseButton;
-use sdl3::pixels::Color;
 use sdl3::VideoSubsystem;
 
 /// Source of frames for one app-surface window.
 enum FrameProducer {
-    /// Local encode→decode round-trip (no device needed).
-    DecodeDemo { enc: TestEncoder, dec: Openh264Decoder, t: u32, w: u32, h: u32 },
     /// Live device stream: a background decode thread delivers frames over a
     /// channel. `_client` keeps the scrcpy server + tunnel alive for the pane's
     /// lifetime (its Drop tears them down when the window closes).
@@ -35,24 +23,8 @@ enum FrameProducer {
 }
 
 impl FrameProducer {
-    fn decode_demo(w: u32, h: u32) -> Option<Self> {
-        Some(FrameProducer::DecodeDemo {
-            enc: TestEncoder::new().ok()?,
-            dec: Openh264Decoder::new().ok()?,
-            t: 0,
-            w,
-            h,
-        })
-    }
-
     fn next_frame(&mut self) -> Option<DecodedFrame> {
         match self {
-            FrameProducer::DecodeDemo { enc, dec, t, w, h } => {
-                let src = video::demo_frame(*t, *w, *h);
-                *t = t.wrapping_add(2);
-                let packet = enc.encode_rgba(&src.rgba, *w, *h).ok()?;
-                dec.decode(&packet).ok().flatten()
-            }
             // Drain to the newest frame (drop stale ones to keep latency low).
             FrameProducer::Live { stream, .. } => {
                 let mut latest = None;
@@ -123,16 +95,6 @@ fn wait_for_runtime(sdl: &sdl3::Sdl) -> Option<androlon_ipc::RuntimeLease> {
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
-}
-
-/// Mirror the device's main display (the "phone in a window" pane).
-fn open_live_surface(
-    video: &VideoSubsystem,
-    cfg: &SdkConfig,
-    lease: Option<androlon_ipc::RuntimeLease>,
-) -> Result<VideoPane, String> {
-    let opts = ScrcpyOptions { max_size: 1024, ..ScrcpyOptions::default() };
-    open_stream_pane(video, cfg, opts, None, None, lease)
 }
 
 /// Coherence: give `package` its own Android virtual display and present it as
@@ -328,53 +290,6 @@ fn open_stream_pane(
         hud_t: std::time::Instant::now(),
         _lease: lease,
     })
-}
-
-/// The confirmed install: APK → install into the runtime → generate a `.app`
-/// bundle in `out_dir` → launch it. Runs on its own thread; progress goes to
-/// the management log via `tx`.
-fn install_apk(
-    apk: String,
-    out_dir: std::path::PathBuf,
-    cfg: SdkConfig,
-    tx: std::sync::mpsc::Sender<String>,
-) {
-    std::thread::spawn(move || {
-        let log = |s: String| {
-            let _ = tx.send(s);
-        };
-        log(format!("› installing {apk}…"));
-        if let Err(e) = std::fs::create_dir_all(&out_dir) {
-            log(format!("✗ create {}: {e}", out_dir.display()));
-            return;
-        }
-        // Bundles run the shared player, not this shell binary.
-        let host = match std::env::current_exe() {
-            Ok(p) => {
-                let player = p.with_file_name("androlon-player");
-                if player.exists() {
-                    player
-                } else {
-                    p // dev fallback: androlon-app handles --app too
-                }
-            }
-            Err(e) => {
-                log(format!("✗ locate androlon-player: {e}"));
-                return;
-            }
-        };
-        match androlon_core::appify::appify(&cfg, apk.as_ref(), &out_dir, &host) {
-            Ok(outcome) => {
-                if !outcome.installed {
-                    log("⚠ APK not installed (is the runtime booted?)".into());
-                }
-                log(format!("✓ {} → {}", outcome.label, outcome.bundle.display()));
-                log(format!("› launching {}…", outcome.label));
-                let _ = std::process::Command::new("open").arg(&outcome.bundle).status();
-            }
-            Err(e) => log(format!("✗ appify failed: {e}")),
-        }
-    });
 }
 
 /// How a pane gets pixels on screen.
@@ -794,327 +709,4 @@ pub fn run_single(package: &str) {
         // input, so poll tightly for low input latency.
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-}
-
-pub fn run() {
-    let sdl = sdl3::init().expect("SDL_Init");
-    let video = sdl.video().expect("SDL video subsystem");
-
-    // Management window: ImGui via the SDLRenderer3 backend.
-    let window = video
-        .window("Androlon", 1000, 680)
-        .position_centered()
-        .resizable()
-        .build()
-        .expect("create management window");
-    let mut canvas = window.into_canvas();
-    let mgmt_id = canvas.window().id();
-
-    let mut imgui = Context::create();
-    let _ = imgui.set_ini_filename::<std::path::PathBuf>(None);
-    let mut backend = Sdl3RendererBackend::init(&mut imgui, canvas.window(), &canvas)
-        .expect("init ImGui SDLRenderer3 backend");
-
-    let cfg = SdkConfig::from_env();
-    let mut app = AppState::new(cfg.clone());
-    let mut panes: Vec<VideoPane> = Vec::new();
-
-    // Install-flow progress: appify jobs run on threads and report here.
-    let (install_tx, install_rx) = std::sync::mpsc::channel::<String>();
-    // Library results: Some(list) replaces the listing, None = the action
-    // finished without changing it.
-    let (lib_tx, lib_rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
-
-    // Test hook: open a decode-demo app surface at startup so the multi-window
-    // path (SDL_Renderer + SDL_GPU coexisting) can be verified without clicking.
-    if std::env::var("ANDROLON_AUTO_SURFACE").is_ok() {
-        if let (Ok(win), Some(source)) = (
-            VideoWindow::new(&video, "Androlon — App surface", 640, 360),
-            FrameProducer::decode_demo(640, 360),
-        ) {
-            println!("✓ auto-opened app surface (id {})", win.id());
-            panes.push(VideoPane {
-                id: win.id(),
-                screen: Screen::Gpu { window: win, source },
-                control: None,
-                stream_size: (640, 360),
-                touch_down: false,
-                keymap: None,
-                joy: JoyState::default(),
-                aim: AimState::default(),
-                title: "Androlon — App surface".into(),
-                hud_t: std::time::Instant::now(),
-                _lease: None,
-            });
-        }
-    }
-
-    // Test hook: open a LIVE scrcpy surface at startup (needs a booted device).
-    if std::env::var("ANDROLON_LIVE").is_ok() {
-        match open_live_surface(&video, &cfg, wait_for_runtime(&sdl)) {
-            Ok(pane) => {
-                println!("✓ live surface opened (id {})", pane.id);
-                panes.push(pane);
-            }
-            Err(e) => eprintln!("✗ live surface: {e}"),
-        }
-    }
-
-    // Test hook: Coherence — give a package its own virtual-display window.
-    // e.g. ANDROLON_COHERENCE=com.android.settings (comma-separate for several).
-    if let Ok(pkgs) = std::env::var("ANDROLON_COHERENCE") {
-        for pkg in pkgs.split(',').filter(|p| !p.is_empty()) {
-            match open_coherence_surface(&video, &cfg, pkg, true, None, wait_for_runtime(&sdl)) {
-                Ok(pane) => {
-                    println!("✓ coherence window for {pkg} (id {})", pane.id);
-                    panes.push(pane);
-                }
-                Err(e) => eprintln!("✗ coherence {pkg}: {e}"),
-            }
-        }
-    }
-
-    'main: loop {
-        // One low-level poll feeds ImGui and our own routing.
-        while let Some(raw) = sdl3_poll_event_ll() {
-            backend.process_event(&mut imgui, &raw);
-            let event = Event::from_ll(raw);
-            match event {
-                Event::Quit { .. } => break 'main,
-                Event::Window { window_id, win_event: WindowEvent::CloseRequested, .. } => {
-                    if window_id == mgmt_id {
-                        break 'main; // closing the control window quits
-                    }
-                    panes.retain(|p| p.id != window_id); // close just that surface
-                }
-                // An .apk arriving — dragged onto a window, or double-clicked
-                // in Finder (macOS delivers "open document" as a drop event).
-                // Inspect it (fast, read-only) and show the installer dialog;
-                // nothing is installed until the user confirms.
-                Event::DropFile { ref filename, .. }
-                    if filename.to_lowercase().ends_with(".apk") =>
-                {
-                    match androlon_core::appify::inspect(&cfg, filename.as_ref()) {
-                        Ok(info) => app.request_install(filename.clone(), info),
-                        Err(e) => app.log_line(format!("✗ {filename}: {e}")),
-                    }
-                }
-                // Input on an app surface → inject into the device.
-                Event::MouseButtonDown { window_id, .. }
-                | Event::MouseButtonUp { window_id, .. }
-                | Event::MouseMotion { window_id, .. }
-                | Event::MouseWheel { window_id, .. }
-                | Event::KeyDown { window_id, .. }
-                | Event::KeyUp { window_id, .. }
-                | Event::Window { window_id, win_event: WindowEvent::FocusLost, .. }
-                    if window_id != mgmt_id =>
-                {
-                    if let Some(pane) = panes.iter_mut().find(|p| p.id == window_id) {
-                        pane.handle_input(&event);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        app.poll();
-        while let Ok(line) = install_rx.try_recv() {
-            app.log_line(line);
-        }
-        while let Ok(result) = lib_rx.try_recv() {
-            match result {
-                Some(list) => app.set_library(list),
-                None => app.library_failed(),
-            }
-        }
-        if let Some(req) = app.take_library_request() {
-            library_action(req, cfg.clone(), install_tx.clone(), lib_tx.clone());
-        }
-
-        // Run an install the user just confirmed in the dialog.
-        if let Some(p) = app.take_install() {
-            install_apk(p.apk, p.dest.into(), cfg.clone(), install_tx.clone());
-        }
-
-        // Draw the management window.
-        backend.new_frame(&mut imgui);
-        let ui = imgui.frame();
-        app.draw(ui);
-        let draw_data = imgui.render();
-        canvas.set_draw_color(Color::RGB(18, 18, 22));
-        canvas.clear();
-        backend.render(draw_data, &canvas);
-        canvas.present();
-
-        // Honour an "open app surface" (demo) request from the UI.
-        if app.take_open_video() {
-            match VideoWindow::new(&video, "Androlon — App surface", 640, 360) {
-                Ok(win) => match FrameProducer::decode_demo(640, 360) {
-                    Some(source) => panes.push(VideoPane {
-                        id: win.id(),
-                        screen: Screen::Gpu { window: win, source },
-                        control: None,
-                        stream_size: (640, 360),
-                        touch_down: false,
-                        keymap: None,
-                        joy: JoyState::default(),
-                        aim: AimState::default(),
-                        title: "Androlon — App surface".into(),
-                        hud_t: std::time::Instant::now(),
-                        _lease: None,
-                    }),
-                    None => app.log_line("✗ could not start decoder for app surface"),
-                },
-                Err(e) => app.log_line(format!("✗ open app surface: {e}")),
-            }
-        }
-
-        // Honour an "open LIVE surface" (scrcpy) request from the UI.
-        if app.take_open_live() {
-            match open_live_surface(&video, &cfg, wait_for_runtime(&sdl)) {
-                Ok(pane) => {
-                    app.log_line(format!("✓ live surface (id {})", pane.id));
-                    panes.push(pane);
-                }
-                Err(e) => app.log_line(format!("✗ live surface: {e}")),
-            }
-        }
-
-        // Present each app-surface window.
-        for pane in &mut panes {
-            let VideoPane { screen, stream_size, title, hud_t, .. } = pane;
-            let mut hud_fps: Option<u32> = None;
-            match screen {
-                Screen::Gpu { window, source } => {
-                    if let Some(frame) = source.next_frame() {
-                        *stream_size = (frame.width, frame.height); // tracks rotation
-                        let _ = window.present(&frame);
-                    }
-                }
-                // Frames are enqueued by the stream thread; just refresh the
-                // size the input path scales against (and sample the fps HUD).
-                #[cfg(target_os = "macos")]
-                Screen::Layer { size, frames, .. } => {
-                    *stream_size = unpack_size(size.load(std::sync::atomic::Ordering::Relaxed));
-                    if hud_t.elapsed() >= std::time::Duration::from_secs(1) {
-                        *hud_t = std::time::Instant::now();
-                        hud_fps = Some(frames.swap(0, std::sync::atomic::Ordering::Relaxed));
-                    }
-                }
-            }
-            if let Some(fps) = hud_fps {
-                screen.set_title(&format!("{title} — {fps} fps"));
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-}
-
-/// Library row actions, off the UI thread. Listing comes from the daemon (the
-/// runtime's own view); the rest go straight through adb, since the hub links
-/// the engine anyway.
-fn library_action(
-    req: LibraryRequest,
-    cfg: SdkConfig,
-    log_tx: std::sync::mpsc::Sender<String>,
-    lib_tx: std::sync::mpsc::Sender<Option<Vec<String>>>,
-) {
-    std::thread::spawn(move || {
-        let log = |s: String| {
-            let _ = log_tx.send(s);
-        };
-        let refresh = |lib_tx: &std::sync::mpsc::Sender<Option<Vec<String>>>| {
-            match androlon_ipc::request("installed-apps", &[]) {
-                Ok(resp) => {
-                    let list = resp.list("packages").map(<[String]>::to_vec).unwrap_or_default();
-                    let _ = lib_tx.send(Some(list));
-                }
-                Err(e) => {
-                    let _ = log_tx.send(format!("✗ library: {e}"));
-                    let _ = lib_tx.send(None);
-                }
-            }
-        };
-
-        match req {
-            LibraryRequest::Refresh => refresh(&lib_tx),
-            LibraryRequest::Launch(pkg) => {
-                // Its own process, exactly as an appified bundle would run it.
-                let player = std::env::current_exe()
-                    .map(|p| p.with_file_name("androlon-player"))
-                    .unwrap_or_else(|_| "androlon-player".into());
-                match std::process::Command::new(&player).args(["--app", &pkg]).spawn() {
-                    Ok(_) => log(format!("✓ opening {pkg}")),
-                    Err(e) => log(format!("✗ open {pkg}: {e}")),
-                }
-                let _ = lib_tx.send(None);
-            }
-            LibraryRequest::Uninstall(pkg) => {
-                // If the app has a Mac bundle, hand it to the Uninstaller —
-                // it removes both halves and confirms first. Only fall back
-                // to a bare package uninstall when there's no bundle to
-                // remove, which is the one case the Uninstaller can't handle.
-                match androlon_core::appify::find_bundle_for_package(&pkg) {
-                    Some(bundle) => {
-                        let tool = std::env::current_exe()
-                            .map(|p| p.with_file_name("androlon-uninstaller"))
-                            .unwrap_or_else(|_| "androlon-uninstaller".into());
-                        match std::process::Command::new(&tool).arg(&bundle).spawn() {
-                            Ok(_) => log(format!("› uninstalling {pkg} — confirm in the window")),
-                            Err(e) => log(format!("✗ uninstaller: {e}")),
-                        }
-                        // The listing refreshes on the next Refresh: the
-                        // Uninstaller is a separate process and the user may
-                        // still cancel it.
-                        let _ = lib_tx.send(None);
-                    }
-                    None => {
-                        let adb = androlon_core::AdbService::new(&cfg);
-                        match adb.adb(&["uninstall", &pkg]) {
-                            Ok(out) if out.ok() => log(format!("✓ uninstalled {pkg}")),
-                            Ok(out) => log(format!("✗ uninstall {pkg}: {}", out.trimmed())),
-                            Err(e) => log(format!("✗ uninstall {pkg}: {e}")),
-                        }
-                        refresh(&lib_tx);
-                    }
-                }
-            }
-            LibraryRequest::MakeApp(pkg) => {
-                // The APK already lives on the device — pull it back so the
-                // same appify path can read its label and icon.
-                let adb = androlon_core::AdbService::new(&cfg);
-                let path = adb.shell(&["pm", "path", &pkg]).ok().and_then(|out| {
-                    out.lines()
-                        .find_map(|l| l.strip_prefix("package:"))
-                        .map(|p| p.trim().to_string())
-                });
-                let Some(device_apk) = path else {
-                    log(format!("✗ {pkg}: could not locate its APK on the device"));
-                    let _ = lib_tx.send(None);
-                    return;
-                };
-                let local = std::env::temp_dir().join(format!("{pkg}.apk"));
-                let local_str = local.display().to_string();
-                if let Err(e) = adb.adb(&["pull", &device_apk, &local_str]) {
-                    log(format!("✗ pull {pkg}: {e}"));
-                    let _ = lib_tx.send(None);
-                    return;
-                }
-                let out_dir = std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join("Applications"))
-                    .unwrap_or_else(|_| ".".into());
-                let _ = std::fs::create_dir_all(&out_dir);
-                let player = std::env::current_exe()
-                    .map(|p| p.with_file_name("androlon-player"))
-                    .unwrap_or_else(|_| "androlon-player".into());
-                match androlon_core::appify::appify(&cfg, &local, &out_dir, &player) {
-                    Ok(done) => log(format!("✓ {} → {}", done.label, done.bundle.display())),
-                    Err(e) => log(format!("✗ make app {pkg}: {e}")),
-                }
-                let _ = std::fs::remove_file(&local);
-                let _ = lib_tx.send(None);
-            }
-        }
-    });
 }

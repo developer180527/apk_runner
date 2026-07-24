@@ -1,0 +1,20 @@
+[package]
+name = "androlon-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "androlon-hub"
+path = "src/main.rs"
+
+[dependencies]
+androlon-core = { path = "../androlon-core" }
+androlon-ipc = { path = "../androlon-ipc" }
+
+# Management UI only — no video, no decoders, no input handling. Those belong
+# to the player. This crate is deliberately thin so the planned native shells
+# (AppKit / WinUI / GTK4) replace one small surface, not an application.
+sdl3 = "0.18"
+dear-imgui-rs = "0.15"
+dear-imgui-sdl3 = { version = "0.15", features = ["sdlrenderer3-renderer"] }

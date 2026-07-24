@@ -1,6 +1,11 @@
-//! Management UI (Dear ImGui): engine health, actions, and a live log. Long
-//! engine actions (setup, boot) run on a worker thread and stream progress back
-//! over an mpsc channel so the UI never blocks.
+//! The Hub's management UI: engine health, runtime actions, the app library,
+//! and a live log. Long actions run on a worker thread and stream progress
+//! back over an mpsc channel so the UI never blocks.
+//!
+//! Deliberately the *only* UI in this crate. Installing, uninstalling, and
+//! running apps all belong to their own suite apps — this is a console, and
+//! it is sized to be replaced by native chrome (AppKit / WinUI / GTK4) later
+//! without touching anything below it.
 
 use androlon_core::backend::AndroidBackend;
 use androlon_core::{AdbService, Avd, BootProfile, DoctorReport, EmulatorService, SdkConfig};
@@ -39,14 +44,6 @@ enum Msg {
     Done,
 }
 
-/// An APK waiting for the user's go-ahead in the installer dialog.
-pub struct PendingInstall {
-    pub apk: String,
-    pub info: androlon_core::appify::ApkInfo,
-    /// Destination folder for the generated .app (editable in the dialog).
-    pub dest: String,
-}
-
 /// A row action in the Library.
 #[derive(Clone)]
 pub enum LibraryRequest {
@@ -64,11 +61,7 @@ pub struct AppState {
     log: Vec<String>,
     busy: bool,
     profile: BootProfile,
-    open_video: bool,
-    open_live: bool,
     rx: Option<Receiver<Msg>>,
-    pending_install: Option<PendingInstall>,
-    confirmed_install: Option<PendingInstall>,
     library: Vec<String>,
     library_busy: bool,
     library_request: Option<LibraryRequest>,
@@ -86,11 +79,7 @@ impl AppState {
             log,
             busy: false,
             profile: BootProfile::Developer,
-            open_video: false,
-            open_live: false,
             rx: None,
-            pending_install: None,
-            confirmed_install: None,
             library: Vec::new(),
             library_busy: false,
             library_request: None,
@@ -112,29 +101,7 @@ impl AppState {
         self.library_busy = false;
     }
 
-    /// Queue the installer dialog for a dropped/double-clicked APK.
-    pub fn request_install(&mut self, apk: String, info: androlon_core::appify::ApkInfo) {
-        let dest = std::env::var("HOME")
-            .map(|h| format!("{h}/Applications"))
-            .unwrap_or_else(|_| ".".into());
-        self.push_log(format!("› install requested: {} ({})", info.label, info.package));
-        self.pending_install = Some(PendingInstall { apk, info, dest });
-    }
 
-    /// Consume a confirmed install (the app loop runs it).
-    pub fn take_install(&mut self) -> Option<PendingInstall> {
-        self.confirmed_install.take()
-    }
-
-    /// Consume a pending "open app surface window" (demo) request.
-    pub fn take_open_video(&mut self) -> bool {
-        std::mem::take(&mut self.open_video)
-    }
-
-    /// Consume a pending "open LIVE surface" (scrcpy) request.
-    pub fn take_open_live(&mut self) -> bool {
-        std::mem::take(&mut self.open_live)
-    }
 
     /// Append a line to the log (used by the app loop to report window events).
     pub fn log_line(&mut self, line: impl Into<String>) {
@@ -194,8 +161,6 @@ impl AppState {
         let busy = self.busy;
         let profile = self.profile;
         let mut toggle_profile = false;
-        let mut open_video = false;
-        let mut open_live = false;
 
         ui.window("Androlon — Control")
             .size([460.0, 640.0], Condition::FirstUseEver)
@@ -265,16 +230,6 @@ impl AppState {
                     }
                 }
 
-                ui.separator();
-                ui.text("App surface");
-                if ui.button("Open surface (demo)") {
-                    open_video = true;
-                }
-                ui.same_line();
-                if ui.button("Open surface (LIVE scrcpy)") {
-                    open_live = true;
-                }
-                ui.text_colored([0.7, 0.7, 0.75, 1.0], "  LIVE needs a booted device + vendor/scrcpy-server");
             });
 
         // Library: what's installed in the runtime, and what you can do with
@@ -329,63 +284,12 @@ impl AppState {
                 }
             });
 
-        // Installer dialog: shown while an APK awaits confirmation. Details
-        // come from `aapt2 dump badging`; nothing is written until Install.
-        let mut install_clicked = false;
-        let mut cancel_clicked = false;
-        if let Some(pending) = &mut self.pending_install {
-            let info = &pending.info;
-            let title = format!("Install “{}”?###installer", info.label);
-            ui.window(title)
-                .size([420.0, 260.0], Condition::FirstUseEver)
-                .position([260.0, 180.0], Condition::FirstUseEver)
-                .build(|| {
-                    ui.text_colored([0.6, 0.85, 1.0, 1.0], &info.label);
-                    ui.separator();
-                    ui.bullet_text(format!("Package   {}", info.package));
-                    ui.bullet_text(format!("Version   {}", info.version));
-                    ui.bullet_text(format!("Min SDK   API {}", info.min_sdk));
-                    ui.bullet_text(format!(
-                        "Size      {:.1} MB",
-                        info.size_bytes as f64 / (1024.0 * 1024.0)
-                    ));
-                    ui.spacing();
-                    ui.text("Create the Mac app in:");
-                    ui.input_text("##dest", &mut pending.dest).build();
-                    ui.text_colored(
-                        [0.7, 0.7, 0.75, 1.0],
-                        "Installs into the Android runtime and creates a native app.",
-                    );
-                    ui.spacing();
-                    if ui.button("Install") {
-                        install_clicked = true;
-                    }
-                    ui.same_line();
-                    if ui.button("Cancel") {
-                        cancel_clicked = true;
-                    }
-                });
-        }
-        if install_clicked {
-            self.confirmed_install = self.pending_install.take();
-        } else if cancel_clicked {
-            if let Some(p) = self.pending_install.take() {
-                self.push_log(format!("✗ install of {} cancelled", p.info.label));
-            }
-        }
-
         if toggle_profile {
             self.profile = match self.profile {
                 BootProfile::Developer => BootProfile::Consumer,
                 BootProfile::Consumer => BootProfile::Developer,
             };
             self.push_log(format!("profile → {}", self.profile.label()));
-        }
-        if open_video {
-            self.open_video = true;
-        }
-        if open_live {
-            self.open_live = true;
         }
         for task in requested {
             self.spawn(task);

@@ -47,9 +47,9 @@ pub fn cmd_bundle_host(cfg: &SdkConfig, args: &[String]) -> androlon_core::Resul
         .map_err(|e| EngineError::Launch { tool: "create bundle".into(), source: e })?;
     // The suite travels together: hub shell + player + installer + runtime
     // daemon side by side, so sibling discovery works from inside the bundle.
-    let hub = host.with_file_name("androlon-app");
+    let hub = host.with_file_name("androlon-hub");
     std::fs::copy(&hub, macos_dir.join("Androlon"))
-        .map_err(|e| EngineError::Launch { tool: "copy androlon-app".into(), source: e })?;
+        .map_err(|e| EngineError::Launch { tool: "copy androlon-hub".into(), source: e })?;
     for tool in ["androlon-player", "androlon-runtimed", "androlon-installer", "androlon-uninstaller"] {
         let src = host.with_file_name(tool);
         if src.exists() {

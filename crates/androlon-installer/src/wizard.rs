@@ -16,10 +16,10 @@
 use androlon_core::appify::ApkInfo;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSBezelStyle, NSBox, NSBoxType, NSButton, NSColor, NSFont, NSImage, NSImageView,
-    NSModalResponse, NSProgressIndicator, NSProgressIndicatorStyle, NSTextField, NSView, NSWindow,
+    NSModalResponse, NSProgressIndicator, NSProgressIndicatorStyle, NSTextField, NSWindow,
     NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
@@ -37,8 +37,8 @@ pub const TAG_BACK: isize = 2;
 pub const TAG_CANCEL: isize = 3;
 pub const TAG_CHOOSE: isize = 4;
 
-/// A tiny Objective-C class so AppKit buttons have a target/action. Each
-/// click ends the modal session with the sender's tag.
+// A tiny Objective-C class so AppKit buttons have a target/action. Each
+// click ends the modal session with the sender's tag.
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -101,7 +101,6 @@ impl Step {
 pub struct Wizard {
     mtm: MainThreadMarker,
     window: Retained<NSWindow>,
-    target: Retained<WizardTarget>,
     step_labels: Vec<Retained<NSTextField>>,
     step_dots: Vec<Retained<NSTextField>>,
     heading: Retained<NSTextField>,
@@ -245,7 +244,6 @@ impl Wizard {
             Wizard {
                 mtm,
                 window,
-                target,
                 step_labels,
                 step_dots,
                 heading,
@@ -404,9 +402,6 @@ impl Wizard {
         unsafe { self.window.close() };
     }
 
-    pub fn window(&self) -> &NSWindow {
-        &self.window
-    }
 }
 
 fn make_label(
@@ -446,7 +441,7 @@ fn make_button(
     unsafe {
         let button = NSButton::initWithFrame(NSButton::alloc(mtm), NSRect::ZERO);
         button.setTitle(&NSString::from_str(title));
-        button.setBezelStyle(NSBezelStyle::Rounded);
+        button.setBezelStyle(NSBezelStyle::Push);
         button.setTag(tag);
         button.setTarget(Some(target));
         button.setAction(Some(WizardTarget::action()));

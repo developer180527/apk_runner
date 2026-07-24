@@ -13,7 +13,7 @@ fn main() {
         .or_else(|| std::env::var("ANDROLON_APP").ok());
 
     match package {
-        Some(pkg) => androlon_app::app::run_single(&pkg),
+        Some(pkg) => androlon_player::app::run_single(&pkg),
         None => {
             eprintln!("androlon-player: no app given (--app <package> or ANDROLON_APP)");
             std::process::exit(2);
