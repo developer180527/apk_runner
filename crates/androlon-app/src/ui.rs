@@ -47,6 +47,17 @@ pub struct PendingInstall {
     pub dest: String,
 }
 
+/// A row action in the Library.
+#[derive(Clone)]
+pub enum LibraryRequest {
+    Refresh,
+    /// Open the app in its own Coherence window.
+    Launch(String),
+    /// Pull the installed APK back off the device and appify it.
+    MakeApp(String),
+    Uninstall(String),
+}
+
 pub struct AppState {
     cfg: SdkConfig,
     report: DoctorReport,
@@ -58,6 +69,9 @@ pub struct AppState {
     rx: Option<Receiver<Msg>>,
     pending_install: Option<PendingInstall>,
     confirmed_install: Option<PendingInstall>,
+    library: Vec<String>,
+    library_busy: bool,
+    library_request: Option<LibraryRequest>,
 }
 
 impl AppState {
@@ -77,7 +91,25 @@ impl AppState {
             rx: None,
             pending_install: None,
             confirmed_install: None,
+            library: Vec::new(),
+            library_busy: false,
+            library_request: None,
         }
+    }
+
+    /// Consume a pending Library action (the app loop runs it off-thread).
+    pub fn take_library_request(&mut self) -> Option<LibraryRequest> {
+        self.library_request.take()
+    }
+
+    /// Replace the Library listing (installed third-party packages).
+    pub fn set_library(&mut self, packages: Vec<String>) {
+        self.library = packages;
+        self.library_busy = false;
+    }
+
+    pub fn library_failed(&mut self) {
+        self.library_busy = false;
     }
 
     /// Queue the installer dialog for a dropped/double-clicked APK.
@@ -244,6 +276,49 @@ impl AppState {
                 }
                 ui.text_colored([0.7, 0.7, 0.75, 1.0], "  LIVE needs a booted device + vendor/scrcpy-server");
             });
+
+        // Library: what's installed in the runtime, and what you can do with
+        // it. Populated from the daemon so it reflects the live runtime.
+        let library = &self.library;
+        let library_busy = self.library_busy;
+        let mut library_request: Option<LibraryRequest> = None;
+        ui.window("Library")
+            .size([460.0, 360.0], Condition::FirstUseEver)
+            .position([492.0, 16.0], Condition::FirstUseEver)
+            .build(|| {
+                if library_busy {
+                    ui.text_colored([1.0, 0.8, 0.3, 1.0], "working…");
+                } else if ui.button("Refresh") {
+                    library_request = Some(LibraryRequest::Refresh);
+                }
+                ui.separator();
+                if library.is_empty() {
+                    ui.text_colored(
+                        [0.7, 0.7, 0.75, 1.0],
+                        "No apps yet. Refresh, or drop an APK on this window.",
+                    );
+                }
+                for pkg in library {
+                    ui.text(pkg);
+                    // Per-row ids so buttons in different rows stay distinct.
+                    if ui.button(format!("Open##{pkg}")) {
+                        library_request = Some(LibraryRequest::Launch(pkg.clone()));
+                    }
+                    ui.same_line();
+                    if ui.button(format!("Make Mac App##{pkg}")) {
+                        library_request = Some(LibraryRequest::MakeApp(pkg.clone()));
+                    }
+                    ui.same_line();
+                    if ui.button(format!("Uninstall##{pkg}")) {
+                        library_request = Some(LibraryRequest::Uninstall(pkg.clone()));
+                    }
+                    ui.separator();
+                }
+            });
+        if let Some(req) = library_request {
+            self.library_busy = true;
+            self.library_request = Some(req);
+        }
 
         ui.window("Log")
             .size([460.0, 260.0], Condition::FirstUseEver)

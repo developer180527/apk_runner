@@ -9,7 +9,7 @@
 
 use crate::input;
 use crate::keymap::{Action, JoyState, Keymap};
-use crate::ui::AppState;
+use crate::ui::{AppState, LibraryRequest};
 use crate::video::{self, VideoWindow};
 use androlon_core::SdkConfig;
 use androlon_stream::control::{self, keycodes, ControlChannel, Position};
@@ -821,6 +821,9 @@ pub fn run() {
 
     // Install-flow progress: appify jobs run on threads and report here.
     let (install_tx, install_rx) = std::sync::mpsc::channel::<String>();
+    // Library results: Some(list) replaces the listing, None = the action
+    // finished without changing it.
+    let (lib_tx, lib_rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
 
     // Test hook: open a decode-demo app surface at startup so the multi-window
     // path (SDL_Renderer + SDL_GPU coexisting) can be verified without clicking.
@@ -918,6 +921,16 @@ pub fn run() {
         while let Ok(line) = install_rx.try_recv() {
             app.log_line(line);
         }
+        while let Ok(result) = lib_rx.try_recv() {
+            match result {
+                Some(list) => app.set_library(list),
+                None => app.library_failed(),
+            }
+        }
+        if let Some(req) = app.take_library_request() {
+            library_action(req, cfg.clone(), install_tx.clone(), lib_tx.clone());
+        }
+
         // Run an install the user just confirmed in the dialog.
         if let Some(p) = app.take_install() {
             install_apk(p.apk, p.dest.into(), cfg.clone(), install_tx.clone());
@@ -996,4 +1009,91 @@ pub fn run() {
 
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
+}
+
+/// Library row actions, off the UI thread. Listing comes from the daemon (the
+/// runtime's own view); the rest go straight through adb, since the hub links
+/// the engine anyway.
+fn library_action(
+    req: LibraryRequest,
+    cfg: SdkConfig,
+    log_tx: std::sync::mpsc::Sender<String>,
+    lib_tx: std::sync::mpsc::Sender<Option<Vec<String>>>,
+) {
+    std::thread::spawn(move || {
+        let log = |s: String| {
+            let _ = log_tx.send(s);
+        };
+        let refresh = |lib_tx: &std::sync::mpsc::Sender<Option<Vec<String>>>| {
+            match androlon_ipc::request("installed-apps", &[]) {
+                Ok(resp) => {
+                    let list = resp.list("packages").map(<[String]>::to_vec).unwrap_or_default();
+                    let _ = lib_tx.send(Some(list));
+                }
+                Err(e) => {
+                    let _ = log_tx.send(format!("✗ library: {e}"));
+                    let _ = lib_tx.send(None);
+                }
+            }
+        };
+
+        match req {
+            LibraryRequest::Refresh => refresh(&lib_tx),
+            LibraryRequest::Launch(pkg) => {
+                // Its own process, exactly as an appified bundle would run it.
+                let player = std::env::current_exe()
+                    .map(|p| p.with_file_name("androlon-player"))
+                    .unwrap_or_else(|_| "androlon-player".into());
+                match std::process::Command::new(&player).args(["--app", &pkg]).spawn() {
+                    Ok(_) => log(format!("✓ opening {pkg}")),
+                    Err(e) => log(format!("✗ open {pkg}: {e}")),
+                }
+                let _ = lib_tx.send(None);
+            }
+            LibraryRequest::Uninstall(pkg) => {
+                let adb = androlon_core::AdbService::new(&cfg);
+                match adb.adb(&["uninstall", &pkg]) {
+                    Ok(out) if out.ok() => log(format!("✓ uninstalled {pkg}")),
+                    Ok(out) => log(format!("✗ uninstall {pkg}: {}", out.trimmed())),
+                    Err(e) => log(format!("✗ uninstall {pkg}: {e}")),
+                }
+                refresh(&lib_tx);
+            }
+            LibraryRequest::MakeApp(pkg) => {
+                // The APK already lives on the device — pull it back so the
+                // same appify path can read its label and icon.
+                let adb = androlon_core::AdbService::new(&cfg);
+                let path = adb.shell(&["pm", "path", &pkg]).ok().and_then(|out| {
+                    out.lines()
+                        .find_map(|l| l.strip_prefix("package:"))
+                        .map(|p| p.trim().to_string())
+                });
+                let Some(device_apk) = path else {
+                    log(format!("✗ {pkg}: could not locate its APK on the device"));
+                    let _ = lib_tx.send(None);
+                    return;
+                };
+                let local = std::env::temp_dir().join(format!("{pkg}.apk"));
+                let local_str = local.display().to_string();
+                if let Err(e) = adb.adb(&["pull", &device_apk, &local_str]) {
+                    log(format!("✗ pull {pkg}: {e}"));
+                    let _ = lib_tx.send(None);
+                    return;
+                }
+                let out_dir = std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join("Applications"))
+                    .unwrap_or_else(|_| ".".into());
+                let _ = std::fs::create_dir_all(&out_dir);
+                let player = std::env::current_exe()
+                    .map(|p| p.with_file_name("androlon-player"))
+                    .unwrap_or_else(|_| "androlon-player".into());
+                match androlon_core::appify::appify(&cfg, &local, &out_dir, &player) {
+                    Ok(done) => log(format!("✓ {} → {}", done.label, done.bundle.display())),
+                    Err(e) => log(format!("✗ make app {pkg}: {e}")),
+                }
+                let _ = std::fs::remove_file(&local);
+                let _ = lib_tx.send(None);
+            }
+        }
+    });
 }
