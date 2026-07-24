@@ -50,7 +50,7 @@ pub fn cmd_bundle_host(cfg: &SdkConfig, args: &[String]) -> androlon_core::Resul
     let hub = host.with_file_name("androlon-app");
     std::fs::copy(&hub, macos_dir.join("Androlon"))
         .map_err(|e| EngineError::Launch { tool: "copy androlon-app".into(), source: e })?;
-    for tool in ["androlon-player", "androlon-runtimed", "androlon-installer"] {
+    for tool in ["androlon-player", "androlon-runtimed", "androlon-installer", "androlon-uninstaller"] {
         let src = host.with_file_name(tool);
         if src.exists() {
             std::fs::copy(&src, macos_dir.join(tool))
@@ -62,6 +62,10 @@ pub fn cmd_bundle_host(cfg: &SdkConfig, args: &[String]) -> androlon_core::Resul
     // rather than the hub. (Xcode ships its helpers the same way.)
     let installer_bundle = bundle.join("Contents/Library/Androlon Installer.app");
     write_installer_bundle(&installer_bundle, &host, cfg)?;
+    // Its counterpart: the only thing that can remove BOTH the Mac app and
+    // the Android package + data behind it (trashing the bundle can't).
+    let uninstaller_bundle = bundle.join("Contents/Library/Androlon Uninstaller.app");
+    write_uninstaller_bundle(&uninstaller_bundle, &host, cfg)?;
 
     let sdk_root = std::fs::canonicalize(&cfg.sdk_root).unwrap_or_else(|_| cfg.sdk_root.clone());
     let server_jar = std::env::var("ANDROLON_SCRCPY_SERVER")
@@ -114,9 +118,11 @@ pub fn cmd_bundle_host(cfg: &SdkConfig, args: &[String]) -> androlon_core::Resul
     let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
     let _ = Command::new(lsregister).arg("-f").arg(&bundle).output();
     let _ = Command::new(lsregister).arg("-f").arg(&installer_bundle).output();
+    let _ = Command::new(lsregister).arg("-f").arg(&uninstaller_bundle).output();
 
     println!("✓ created {}", bundle.display());
     println!("  + {}", installer_bundle.display());
+    println!("  + {}", uninstaller_bundle.display());
     println!("  registered as a handler for .apk files.");
     println!("  Double-click an APK → if Finder asks, choose Androlon (or right-click →");
     println!("  Open With → Androlon). Androlon installs it, creates the app bundle, and");
@@ -223,6 +229,66 @@ fn write_installer_bundle(
     );
     std::fs::write(bundle.join("Contents/Info.plist"), plist)
         .map_err(|e| EngineError::Launch { tool: "write installer plist".into(), source: e })?;
+    let _ = Command::new("codesign").args(["--force", "--deep", "-s", "-"]).arg(bundle).output();
+    Ok(())
+}
+
+/// The Uninstaller app. No document types: it is opened deliberately, or
+/// handed a bundle path by the Hub — an uninstaller should never be what
+/// double-clicking something invokes by accident.
+fn write_uninstaller_bundle(
+    bundle: &std::path::Path,
+    host: &PathBuf,
+    cfg: &SdkConfig,
+) -> androlon_core::Result<()> {
+    let macos_dir = bundle.join("Contents/MacOS");
+    std::fs::create_dir_all(&macos_dir)
+        .map_err(|e| EngineError::Launch { tool: "create uninstaller bundle".into(), source: e })?;
+    let src = host.with_file_name("androlon-uninstaller");
+    if !src.exists() {
+        return Err(EngineError::SdkMissing(format!(
+            "androlon-uninstaller binary at {}",
+            src.display()
+        )));
+    }
+    std::fs::copy(&src, macos_dir.join("Androlon Uninstaller"))
+        .map_err(|e| EngineError::Launch { tool: "copy uninstaller".into(), source: e })?;
+
+    let sdk_root = std::fs::canonicalize(&cfg.sdk_root).unwrap_or_else(|_| cfg.sdk_root.clone());
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Androlon Uninstaller</string>
+    <key>CFBundleDisplayName</key>
+    <string>Androlon Uninstaller</string>
+    <key>CFBundleExecutable</key>
+    <string>Androlon Uninstaller</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.androlon.uninstaller</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSEnvironment</key>
+    <dict>
+        <key>APKRUN_SDK</key>
+        <string>{sdk}</string>
+        <key>ANDROLON_RUNTIMED</key>
+        <string>{runtimed}</string>
+    </dict>
+</dict>
+</plist>
+"#,
+        sdk = sdk_root.display(),
+        runtimed = host.with_file_name("androlon-runtimed").display(),
+    );
+    std::fs::write(bundle.join("Contents/Info.plist"), plist)
+        .map_err(|e| EngineError::Launch { tool: "write uninstaller plist".into(), source: e })?;
     let _ = Command::new("codesign").args(["--force", "--deep", "-s", "-"]).arg(bundle).output();
     Ok(())
 }

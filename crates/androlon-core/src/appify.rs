@@ -83,12 +83,16 @@ pub fn appify(
     let label = extract(&badging, "application-label:'")
         .or_else(|| extract(&badging, "application-label-en:'"))
         .unwrap_or_else(|| package.clone());
+    // Store names are long and punctuated; ':' in particular is rendered as
+    // '/' by Finder and upsets codesign, so build the bundle from a
+    // filesystem-safe form while keeping `label` for display.
+    let file_name = safe_name(&label);
 
     // ---- 2. Install into the runtime (best-effort; needs a booted device) ----
     let installed = AdbService::new(cfg).install(apk).is_ok();
 
     // ---- 3. Bundle skeleton + executable ----
-    let bundle = out_dir.join(format!("{label}.app"));
+    let bundle = out_dir.join(format!("{file_name}.app"));
     let macos_dir = bundle.join("Contents/MacOS");
     let res_dir = bundle.join("Contents/Resources");
     std::fs::create_dir_all(&macos_dir).map_err(io_err("create bundle"))?;
@@ -98,7 +102,7 @@ pub fn appify(
     // name. A SYMLINK to the shared player: bundles never go stale on
     // rebuild, and the exec path stays inside the bundle so macOS resolves
     // the right bundle identity (icon, name).
-    let exe_name = label.replace('/', "-");
+    let exe_name = file_name.clone();
     let exe_dest = macos_dir.join(&exe_name);
     let target = std::fs::canonicalize(host_binary).unwrap_or_else(|_| host_binary.to_path_buf());
     let _ = std::fs::remove_file(&exe_dest);
@@ -168,7 +172,21 @@ pub fn appify(
         .arg(&bundle)
         .output();
 
+    // Register with Launch Services. Without this the bundle is unknown to
+    // the system, so Finder falls back to the generic application icon even
+    // though CFBundleIconFile and the .icns are both correct — and bumping
+    // the mtime invalidates any icon Finder cached for this path before.
+    let _ = filetime_touch(&bundle);
+    let _ = Command::new(LSREGISTER).arg("-f").arg(&bundle).output();
+
     Ok(AppifyOutcome { label, package, bundle, installed, icon })
+}
+
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+/// Bump the bundle's modification time so Finder re-reads its icon.
+fn filetime_touch(bundle: &Path) -> std::io::Result<()> {
+    Command::new("touch").arg(bundle).output().map(|_| ())
 }
 
 /// Pull the value after `key` up to the closing quote.
@@ -242,10 +260,30 @@ fn icon_source(badging: &str, apk: &Path) -> std::result::Result<Option<PathBuf>
         .output()
         .map_err(|e| format!("unzip: {e}"))?;
     let mut best: Option<(u32, PathBuf)> = None;
-    let entries =
-        std::fs::read_dir(rasters.join("res")).map_err(|_| "no raster resources in APK".to_string())?;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // Walk recursively: a normal APK stores icons in res/mipmap-<density>/,
+    // not at the top of res/ (only name-obfuscated builds are flat).
+    let mut candidates = Vec::new();
+    let mut stack = vec![rasters.join("res")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                candidates.push(path);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err("no raster resources in APK".to_string());
+    }
+    for path in candidates {
+        // Prefer launcher icons when the names survived minification.
+        let is_launcher = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("launcher") || n.contains("icon"));
         let out = Command::new("sips")
             .args(["-g", "pixelWidth", "-g", "pixelHeight"])
             .arg(&path)
@@ -257,8 +295,11 @@ fn icon_source(badging: &str, apk: &Path) -> std::result::Result<Option<PathBuf>
             line.rsplit(' ').next()?.parse().ok()
         };
         if let (Some(w), Some(h)) = (dim("pixelWidth"), dim("pixelHeight")) {
-            if w == h && (48..=1024).contains(&w) && best.as_ref().map_or(true, |(bw, _)| w > *bw) {
-                best = Some((w, path));
+            // Square, plausibly a launcher icon, and the biggest so far. A
+            // name match wins over a merely larger non-icon image.
+            let score = w + if is_launcher { 4096 } else { 0 };
+            if w == h && (48..=1024).contains(&w) && best.as_ref().map_or(true, |(b, _)| score > *b) {
+                best = Some((score, path));
             }
         }
     }
@@ -329,4 +370,46 @@ fn run_capture(tool: &Path, args: &[&str]) -> Result<String> {
 
 fn io_err(what: &'static str) -> impl Fn(std::io::Error) -> EngineError {
     move |e| EngineError::Launch { tool: what.to_string(), source: e }
+}
+
+/// A label trimmed to something safe as a bundle/executable name: no path
+/// separators or colons (Finder shows ':' as '/'), no leading dot, and short
+/// enough to stay readable in the Dock.
+fn safe_name(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| match c {
+            '/' | ':' | '\\' => '-',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    // Store titles often carry a subtitle after ':' or '-'; the first clause
+    // is the app's actual name and all a Dock icon can show anyway.
+    let first = cleaned.split(" - ").next().unwrap_or(&cleaned);
+    let first = first.split('-').next().unwrap_or(first);
+    let trimmed = first.trim().trim_start_matches('.').trim();
+    let name = if trimmed.is_empty() { cleaned.trim() } else { trimmed };
+    name.chars().take(40).collect::<String>().trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_name;
+
+    #[test]
+    fn strips_colons_and_subtitles() {
+        assert_eq!(
+            safe_name("Fire Free Offline Shooting Game: Gun Games Offline"),
+            "Fire Free Offline Shooting Game"
+        );
+        assert_eq!(safe_name("CalcYou"), "CalcYou");
+        assert_eq!(safe_name("Some/App"), "Some");
+    }
+
+    #[test]
+    fn never_yields_an_empty_or_hidden_name() {
+        assert!(!safe_name("...").is_empty());
+        assert!(!safe_name(".hidden").starts_with('.'));
+    }
 }

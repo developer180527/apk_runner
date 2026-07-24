@@ -8,6 +8,7 @@ members = [
     "crates/androlon-ipc",
     "crates/androlon-runtimed",
     "crates/androlon-installer",
+    "crates/androlon-uninstaller",
 ]
 
 [workspace.package]

@@ -1,11 +1,11 @@
 [package]
-name = "androlon-installer"
+name = "androlon-uninstaller"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "androlon-installer"
+name = "androlon-uninstaller"
 path = "src/main.rs"
 
 [dependencies]

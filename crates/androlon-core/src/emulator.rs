@@ -72,15 +72,20 @@ impl EmulatorService {
         // "improving" values here — several innocuous-looking edits (screen
         // size not matching the device profile, a missing hw.device.hash2)
         // were enough to send it back to a TCG non-boot.
+        //
+        // Cores and RAM are the exception, and are deliberately generous:
+        // the emulator has no hardware video encoder, so scrcpy's H.264
+        // encode runs on guest CPU and is the frame-rate ceiling for games.
+        // Guest cores buy encode headroom directly.
         let config = format!(
             "AvdId={name}\n\
              avd.ini.displayname={name}\n\
              avd.ini.encoding=UTF-8\n\
              abi.type={abi}\n\
              hw.cpu.arch=arm64\n\
-             hw.cpu.ncore=4\n\
-             hw.ramSize=2048\n\
-             vm.heapSize=228\n\
+             hw.cpu.ncore=6\n\
+             hw.ramSize=6144\n\
+             vm.heapSize=512\n\
              disk.dataPartition.size=10G\n\
              sdcard.size=512M\n\
              hw.sdCard=yes\n\

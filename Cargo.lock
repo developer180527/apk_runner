@@ -41,6 +41,7 @@ name = "androlon-installer"
 version = "0.1.0"
 dependencies = [
  "androlon-core",
+ "androlon-ipc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -64,6 +65,17 @@ version = "0.1.0"
 dependencies = [
  "androlon-core",
  "openh264",
+]
+
+[[package]]
+name = "androlon-uninstaller"
+version = "0.1.0"
+dependencies = [
+ "androlon-core",
+ "androlon-ipc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
 ]
 
 [[package]]

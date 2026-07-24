@@ -104,21 +104,36 @@ mod mac {
                         let (cfg2, apk2, dest2, player) =
                             (cfg.clone(), apk.clone(), dest.clone(), player_binary());
                         let outcome = wizard.run_with_progress(move || {
-                            appify::appify(&cfg2, &apk2, &dest2, &player)
-                                .map_err(|e| e.to_string())
+                            // Bring the runtime up FIRST and hold the lease
+                            // across the install. Without this the APK install
+                            // silently fails when nothing is booted, and the
+                            // app launches onto an empty display — a blank
+                            // window at 0 fps, with no clue why.
+                            let lease = androlon_ipc::RuntimeLease::acquire()
+                                .map(|(lease, _)| lease)
+                                .map_err(|e| format!("could not start the Android runtime: {e}"))?;
+                            let result = appify::appify(&cfg2, &apk2, &dest2, &player)
+                                .map_err(|e| e.to_string());
+                            drop(lease);
+                            result
                         });
                         match outcome {
                             Ok(done) => {
+                                // Refuse to present a working install we know
+                                // isn't one: launching here is what produced
+                                // the blank 0 fps window.
                                 if !done.installed {
                                     alert(
                                         mtm,
-                                        "The app was created, but not installed yet",
-                                        "The Android runtime wasn't reachable, so the APK \
-                                         couldn't be installed into it. Opening the app will \
-                                         start the runtime; if it doesn't launch, install again.",
+                                        "Couldn't install into the Android runtime",
+                                        "The Mac app was created, but the APK did not install, \
+                                         so it has nothing to run. This usually means the \
+                                         runtime failed to start. Try installing again once \
+                                         Androlon reports the runtime as running.",
                                         &["OK"],
                                         icon.as_deref(),
                                     );
+                                    return;
                                 }
                                 bundle = Some(done.bundle);
                                 step = Step::Summary;

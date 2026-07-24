@@ -284,9 +284,23 @@ impl ScrcpyClient {
         Ok((VideoStream { stream, meta }, audio, control))
     }
 
+    /// Tear down the server, the tunnel, and — importantly — the server
+    /// process *on the device*.
+    ///
+    /// Killing the local `adb shell` client does not kill `app_process` on
+    /// the other side, and a Coherence session's `new_display` virtual
+    /// display is owned by that process: Android only releases a
+    /// VirtualDisplay when its owner dies. Leaving it running leaks a display
+    /// per pane for the runtime's whole lifetime. `scid` is unique per
+    /// client, so matching on it targets exactly our server and never a
+    /// sibling pane's.
     pub fn stop(&mut self) {
+        let scid = self.opts.scid.clone();
+        let _ = self.adb().adb(&["shell", "pkill", "-f", &format!("scid={scid}")]);
+
         if let Some(mut child) = self.server.take() {
             let _ = child.kill();
+            let _ = child.wait(); // don't leave a zombie adb client behind
         }
         let tcp = format!("tcp:{}", self.opts.port);
         let _ = self.adb_ok(&["forward", "--remove", &tcp]);
