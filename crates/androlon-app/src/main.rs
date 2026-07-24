@@ -6,14 +6,7 @@
 //! Pass `--headless` to run the init + one engine snapshot and exit (CI / no
 //! display), skipping the window and event loop.
 
-mod app;
-#[cfg(target_os = "macos")]
-mod avlayer;
-mod input;
-mod keymap;
-mod ui;
-mod video;
-
+use androlon_app::{app, video};
 use androlon_core::{EmulatorService, SdkConfig};
 
 fn main() {

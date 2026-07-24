@@ -94,10 +94,18 @@ pub fn appify(
     std::fs::create_dir_all(&macos_dir).map_err(io_err("create bundle"))?;
     std::fs::create_dir_all(&res_dir).map_err(io_err("create bundle"))?;
 
-    // Named after the app so the process — and the menu bar — carries its name.
+    // Named after the app so the process — and the menu bar — carries its
+    // name. A SYMLINK to the shared player: bundles never go stale on
+    // rebuild, and the exec path stays inside the bundle so macOS resolves
+    // the right bundle identity (icon, name).
     let exe_name = label.replace('/', "-");
     let exe_dest = macos_dir.join(&exe_name);
-    std::fs::copy(host_binary, &exe_dest).map_err(io_err("copy androlon-app"))?;
+    let target = std::fs::canonicalize(host_binary).unwrap_or_else(|_| host_binary.to_path_buf());
+    let _ = std::fs::remove_file(&exe_dest);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &exe_dest).map_err(io_err("link player"))?;
+    #[cfg(not(unix))]
+    std::fs::copy(&target, &exe_dest).map_err(io_err("copy player"))?;
 
     // ---- 4. Icon: densest raster icon in the APK → .icns ----
     let icon = build_icns(&badging, apk, &res_dir).unwrap_or(false);

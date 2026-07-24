@@ -45,8 +45,18 @@ pub fn cmd_bundle_host(cfg: &SdkConfig, args: &[String]) -> androlon_core::Resul
     let macos_dir = bundle.join("Contents/MacOS");
     std::fs::create_dir_all(&macos_dir)
         .map_err(|e| EngineError::Launch { tool: "create bundle".into(), source: e })?;
-    std::fs::copy(&host, macos_dir.join("Androlon"))
+    // The suite travels together: hub shell + player + runtime daemon live
+    // side by side in the bundle, so sibling discovery works from inside it.
+    let hub = host.with_file_name("androlon-app");
+    std::fs::copy(&hub, macos_dir.join("Androlon"))
         .map_err(|e| EngineError::Launch { tool: "copy androlon-app".into(), source: e })?;
+    for tool in ["androlon-player", "androlon-runtimed"] {
+        let src = host.with_file_name(tool);
+        if src.exists() {
+            std::fs::copy(&src, macos_dir.join(tool))
+                .map_err(|e| EngineError::Launch { tool: format!("copy {tool}"), source: e })?;
+        }
+    }
 
     let sdk_root = std::fs::canonicalize(&cfg.sdk_root).unwrap_or_else(|_| cfg.sdk_root.clone());
     let server_jar = std::env::var("ANDROLON_SCRCPY_SERVER")
@@ -127,14 +137,14 @@ fn out_dir_arg(args: &[String]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The androlon-app binary shipped next to androlon-ctl.
+/// The shared player binary shipped next to androlon-ctl.
 fn host_binary() -> androlon_core::Result<PathBuf> {
     let host = std::env::current_exe()
         .map_err(|e| EngineError::Launch { tool: "locate androlon-ctl".into(), source: e })?
-        .with_file_name("androlon-app");
+        .with_file_name("androlon-player");
     if !host.exists() {
         return Err(EngineError::SdkMissing(format!(
-            "androlon-app binary (expected next to androlon-ctl at {})",
+            "androlon-player binary (expected next to androlon-ctl at {})",
             host.display()
         )));
     }

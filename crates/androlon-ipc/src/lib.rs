@@ -61,8 +61,20 @@ pub struct RuntimeLease {
 }
 
 impl RuntimeLease {
+    /// Acquire on a background thread, so a caller with an event loop can stay
+    /// responsive while a cold runtime boots (which can take minutes). Poll
+    /// the returned receiver; the app is free to draw a "starting…" state.
+    pub fn acquire_async() -> std::sync::mpsc::Receiver<std::io::Result<RuntimeLease>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(RuntimeLease::acquire().map(|(lease, _)| lease));
+        });
+        rx
+    }
+
     /// Ask the daemon to boot (if needed) and hold a lease on the runtime.
-    /// Blocks until adb reports the device ready.
+    /// **Blocks** until adb reports the device ready — never call this on a
+    /// thread that owns a UI event loop; use `acquire_async` there.
     pub fn acquire() -> std::io::Result<(RuntimeLease, Response)> {
         let mut stream = connect_or_spawn()?;
         stream.write_all(b"{\"req\":\"ensure-booted\"}\n")?;

@@ -23,7 +23,10 @@ impl Default for SdkConfig {
         SdkConfig {
             sdk_root: PathBuf::from(".android-sdk"),
             api: 37, // Android 17
-            platform_tag: "37.0".to_string(),
+            // 37.1, not 37.0: the 37.0 ps16k image fails the emulator's HVF
+            // probe (permanent TCG + "hvf is not enabled" warning); 37.1
+            // boots with HVF. Verified on-device 2026-07-24.
+            platform_tag: "37.1".to_string(),
             image_type: "google_apis_ps16k".to_string(),
             abi: "arm64-v8a".to_string(),
             build_tools: "37.0.0".to_string(),

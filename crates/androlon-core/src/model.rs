@@ -101,15 +101,48 @@ impl RuntimeKind {
 pub struct Avd {
     pub name: String,
     pub device_profile: String,
+    /// (width, height, dpi) written into the AVD config. Coherence gives each
+    /// app its own virtual display, so this is just the backing display.
+    pub screen: (u32, u32, u32),
+    /// The emulator's own hash of the device profile. It must match the
+    /// profile, or hardware resolution falls back to defaults.
+    pub device_hash: String,
 }
 
 impl Avd {
     pub fn phone() -> Self {
-        Avd { name: "androlon_phone".into(), device_profile: "pixel_7".into() }
+        Avd {
+            name: "androlon_phone".into(),
+            device_profile: "medium_phone".into(),
+            screen: (1080, 2400, 420),
+            device_hash: MEDIUM_PHONE_HASH.into(),
+        }
     }
+    /// The backing runtime display. Coherence gives each app its own virtual
+    /// display, so this is never what the user sees — keep it consistent with
+    /// `device_profile` (a profile/screen mismatch confuses the emulator's
+    /// hardware resolution).
     pub fn desktop() -> Self {
-        Avd { name: "androlon_desktop".into(), device_profile: "10.1in WXGA (Tablet)".into() }
+        Avd {
+            name: "androlon_desktop".into(),
+            device_profile: "medium_phone".into(),
+            screen: (1080, 2400, 420),
+            device_hash: MEDIUM_PHONE_HASH.into(),
+        }
     }
+}
+
+/// `hw.device.hash2` for the `medium_phone` profile, as the emulator computes it.
+const MEDIUM_PHONE_HASH: &str = "MD5:3db3250dab5d0d93b29353040181c7e9";
+
+/// Where AVDs live (`$ANDROID_AVD_HOME`, else `~/.android/avd`).
+pub fn avd_home() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("ANDROID_AVD_HOME") {
+        return std::path::PathBuf::from(dir);
+    }
+    std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".android/avd"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(".android/avd"))
 }
 
 /// Presence check for one required tool.

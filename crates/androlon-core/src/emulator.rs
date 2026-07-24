@@ -2,7 +2,7 @@ use crate::adb::AdbService;
 use crate::backend::{AndroidBackend, Gfxstream, GpuBackend};
 use crate::config::{is_executable, SdkConfig};
 use crate::error::{EngineError, Result};
-use crate::model::{Avd, BootProfile, DoctorReport, RootStatus, RuntimeKind, ToolCheck};
+use crate::model::{avd_home, Avd, BootProfile, DoctorReport, RootStatus, RuntimeKind, ToolCheck};
 use crate::subprocess::{run, run_checked, spawn_detached};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -48,6 +48,122 @@ impl EmulatorService {
         self.adb().device_online()
     }
 
+    /// Replace avdmanager's generated `config.ini` with one we control.
+    ///
+    /// Two things matter here, both diagnosed 2026-07-24 against an identical
+    /// system image that boots fine from a hand-written config:
+    ///
+    /// 1. **`tag.ids` must declare `page_size_16kb`** for `_ps16k` images.
+    ///    Without it the emulator misconfigures the guest page size, refuses
+    ///    HVF ("hvf is not enabled on this aarch64 host"), silently falls back
+    ///    to TCG, and never finishes booting. Apple Silicon is natively
+    ///    16 KB-page, so this is the difference between a 25-second boot and
+    ///    an infinite one.
+    /// 2. avdmanager emits unsubstituted template placeholders
+    ///    (`avd.id=<build>`, `disk.dataPartition.path=<temp>`) and
+    ///    `hw.gpu.enabled=no`.
+    fn write_avd_config(&self, avd: &Avd) -> Result<()> {
+        let dir = avd_home().join(format!("{}.avd", avd.name));
+        if !dir.is_dir() {
+            return Ok(()); // avdmanager put it somewhere unexpected; leave it be
+        }
+        let (w, h, density) = avd.screen;
+        // Field-for-field the config verified to boot with HVF. Resist
+        // "improving" values here — several innocuous-looking edits (screen
+        // size not matching the device profile, a missing hw.device.hash2)
+        // were enough to send it back to a TCG non-boot.
+        let config = format!(
+            "AvdId={name}\n\
+             avd.ini.displayname={name}\n\
+             avd.ini.encoding=UTF-8\n\
+             abi.type={abi}\n\
+             hw.cpu.arch=arm64\n\
+             hw.cpu.ncore=4\n\
+             hw.ramSize=2048\n\
+             vm.heapSize=228\n\
+             disk.dataPartition.size=10G\n\
+             sdcard.size=512M\n\
+             hw.sdCard=yes\n\
+             hw.gpu.enabled=yes\n\
+             hw.gpu.mode=auto\n\
+             hw.keyboard=yes\n\
+             hw.mainKeys=no\n\
+             hw.dPad=no\n\
+             hw.trackBall=no\n\
+             hw.gps=yes\n\
+             hw.lcd.width={w}\n\
+             hw.lcd.height={h}\n\
+             hw.lcd.density={density}\n\
+             hw.initialOrientation=portrait\n\
+             hw.audioInput=yes\n\
+             hw.battery=yes\n\
+             hw.accelerometer=yes\n\
+             hw.gyroscope=yes\n\
+             hw.sensors.orientation=yes\n\
+             hw.sensors.proximity=yes\n\
+             hw.sensors.light=yes\n\
+             hw.sensors.magnetic_field=yes\n\
+             hw.sensors.pressure=yes\n\
+             hw.camera.back=virtualscene\n\
+             hw.camera.front=emulated\n\
+             hw.arc=false\n\
+             hw.device.manufacturer=Generic\n\
+             hw.device.name={profile}\n\
+             hw.device.hash2={hash2}\n\
+             skin.dynamic=yes\n\
+             showDeviceFrame=yes\n\
+             fastboot.forceFastBoot=yes\n\
+             fastboot.forceColdBoot=no\n\
+             fastboot.forceChosenSnapshotBoot=no\n\
+             fastboot.chosenSnapshotFile=\n\
+             PlayStore.enabled={playstore}\n\
+             image.sysdir.1=system-images/android-{tag}/{image_type}/{abi}/\n\
+             tag.id={image_type_base}\n\
+             tag.display={image_type_base}\n\
+             tag.ids={tag_ids}\n\
+             target=android-{tag}\n\
+             runtime.network.latency=none\n\
+             runtime.network.speed=full\n",
+            name = avd.name,
+            abi = self.config.abi,
+            profile = avd.device_profile,
+            hash2 = avd.device_hash,
+            tag = self.config.platform_tag,
+            image_type = self.config.image_type,
+            // The tag id drops the page-size suffix the image dir carries…
+            image_type_base = self.config.image_type.replace("_ps16k", ""),
+            // …and `tag.ids` re-declares it as a separate tag. Required: see
+            // the note above — without it HVF is refused and boot never ends.
+            tag_ids = if self.config.image_type.contains("ps16k") {
+                format!("{},page_size_16kb", self.config.image_type.replace("_ps16k", ""))
+            } else {
+                self.config.image_type.clone()
+            },
+            playstore = self.config.image_type.contains("playstore"),
+        );
+        std::fs::write(dir.join("config.ini"), config).map_err(|e| EngineError::Launch {
+            tool: "write AVD config".into(),
+            source: e,
+        })?;
+
+        // …and the sibling `<name>.ini`, which avdmanager fills in with
+        // `target=android-0` when it can't resolve the platform package. The
+        // emulator reads the target from here; an unresolvable one leaves the
+        // VM misconfigured, HVF refused, and the boot hanging in TCG forever.
+        let ini = format!(
+            "avd.ini.encoding=UTF-8\n\
+             path={dir}\n\
+             path.rel=avd/{name}.avd\n\
+             target=android-{tag}\n",
+            dir = dir.display(),
+            name = avd.name,
+            tag = self.config.platform_tag,
+        );
+        std::fs::write(avd_home().join(format!("{}.ini", avd.name)), ini).map_err(|e| {
+            EngineError::Launch { tool: "write AVD ini".into(), source: e }
+        })
+    }
+
     /// Boot an AVD detached and wait for `sys.boot_completed`. The profile picks
     /// snapshot behaviour: Developer (`-no-snapshot`, deterministic + root-safe)
     /// vs Consumer (Quick Boot fast resume).
@@ -76,9 +192,14 @@ impl EmulatorService {
         }
         let mut args: Vec<String> = vec!["-avd".into(), avd.name.clone()];
         args.extend(profile.snapshot_args());
-        args.extend(self.gpu.emulator_args());
         if headless {
+            // Without a window, `-gpu auto` falls back to SwiftShader
+            // (software) — force the host GPU so games stay accelerated.
             args.push("-no-window".into());
+            args.push("-gpu".into());
+            args.push("host".into());
+        } else {
+            args.extend(self.gpu.emulator_args());
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let _child = spawn_detached(
@@ -181,6 +302,7 @@ impl AndroidBackend for EmulatorService {
             &self.config.tool_dirs(),
             &self.config.tool_env(),
         )?;
+        self.write_avd_config(avd)?;
         Ok(())
     }
 

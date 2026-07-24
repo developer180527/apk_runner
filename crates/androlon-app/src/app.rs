@@ -89,10 +89,50 @@ fn use_avlayer() -> bool {
         && std::env::var("ANDROLON_PRESENT").map(|v| v != "gpu").unwrap_or(true)
 }
 
+/// Wait for the runtime daemon to have Android up, WITHOUT blocking the SDL
+/// event loop — a cold boot takes minutes, and an app that stops servicing
+/// its event loop is what macOS reports as "not responding". Pumps events
+/// while it waits; returns the lease (None = no daemon, assume a booted
+/// device, which is how a manually-started emulator still works).
+fn wait_for_runtime(sdl: &sdl3::Sdl) -> Option<androlon_ipc::RuntimeLease> {
+    let rx = androlon_ipc::RuntimeLease::acquire_async();
+    let mut pump = sdl.event_pump().ok();
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(lease)) => return Some(lease),
+            Ok(Err(e)) => {
+                eprintln!("⚠ runtime daemon unavailable ({e}); assuming a booted device");
+                return None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        // Servicing events is what keeps the app alive in the OS's eyes.
+        if let Some(pump) = pump.as_mut() {
+            for event in pump.poll_iter() {
+                if matches!(event, Event::Quit { .. }) {
+                    std::process::exit(0);
+                }
+            }
+        }
+        if !announced && started.elapsed() > std::time::Duration::from_secs(3) {
+            announced = true;
+            println!("› starting the Android runtime (first boot can take a few minutes)…");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
 /// Mirror the device's main display (the "phone in a window" pane).
-fn open_live_surface(video: &VideoSubsystem, cfg: &SdkConfig) -> Result<VideoPane, String> {
+fn open_live_surface(
+    video: &VideoSubsystem,
+    cfg: &SdkConfig,
+    lease: Option<androlon_ipc::RuntimeLease>,
+) -> Result<VideoPane, String> {
     let opts = ScrcpyOptions { max_size: 1024, ..ScrcpyOptions::default() };
-    open_stream_pane(video, cfg, opts, None, None)
+    open_stream_pane(video, cfg, opts, None, None, lease)
 }
 
 /// Coherence: give `package` its own Android virtual display and present it as
@@ -105,6 +145,7 @@ fn open_coherence_surface(
     // Some = play device audio through this host subsystem. Audio capture is
     // device-wide, so exactly one pane should have it (the single-app pane).
     sound: Option<&sdl3::AudioSubsystem>,
+    lease: Option<androlon_ipc::RuntimeLease>,
 ) -> Result<VideoPane, String> {
     // Size is in *window points* (default 800x500). The virtual display is
     // created at 2x pixels with a matching 2x Android density (320 = 2x mdpi),
@@ -133,7 +174,7 @@ fn open_coherence_surface(
         audio: sound.is_some(),
         ..ScrcpyOptions::default()
     };
-    open_stream_pane(video, cfg, opts, Some((package, (ww, wh))), sound)
+    open_stream_pane(video, cfg, opts, Some((package, (ww, wh))), sound, lease)
 }
 
 fn open_stream_pane(
@@ -143,23 +184,15 @@ fn open_stream_pane(
     // Coherence: (package, window size in points). None = mirror pane.
     app: Option<(&str, (u32, u32))>,
     sound: Option<&sdl3::AudioSubsystem>,
+    // Runtime lease to hand to the pane (kept alive for its lifetime).
+    lease: Option<androlon_ipc::RuntimeLease>,
 ) -> Result<VideoPane, String> {
     if let Ok(path) = std::env::var("ANDROLON_SCRCPY_SERVER") {
         opts.server_jar = path.into();
     }
 
-    // Ask the runtime daemon for the Android runtime (boots it headless if
-    // needed) and hold the lease for this pane's lifetime — the emulator
-    // stays up while any pane is open, and lingers briefly after the last
-    // one closes. If the daemon can't be reached, fall through: a manually
-    // booted device still works exactly as before.
-    let lease = match androlon_ipc::RuntimeLease::acquire() {
-        Ok((lease, _)) => Some(lease),
-        Err(e) => {
-            eprintln!("⚠ runtime daemon unavailable ({e}); assuming a booted device");
-            None
-        }
-    };
+    // The caller is responsible for having the runtime up (see
+    // `wait_for_runtime`, which does it without blocking an event loop).
 
     let mut client = ScrcpyClient::new(cfg.clone(), opts);
     client.deploy_server().map_err(|e| format!("deploy server: {e}"))?;
@@ -315,10 +348,18 @@ fn install_apk(
             log(format!("✗ create {}: {e}", out_dir.display()));
             return;
         }
+        // Bundles run the shared player, not this shell binary.
         let host = match std::env::current_exe() {
-            Ok(p) => p,
+            Ok(p) => {
+                let player = p.with_file_name("androlon-player");
+                if player.exists() {
+                    player
+                } else {
+                    p // dev fallback: androlon-app handles --app too
+                }
+            }
             Err(e) => {
-                log(format!("✗ locate androlon-app: {e}"));
+                log(format!("✗ locate androlon-player: {e}"));
                 return;
             }
         };
@@ -703,9 +744,12 @@ pub fn run_single(package: &str) {
     let video = sdl.video().expect("SDL video subsystem");
     let cfg = SdkConfig::from_env();
 
+    // Bring the runtime up first, staying responsive while it boots.
+    let lease = wait_for_runtime(&sdl);
     // The single-app pane owns the device audio (capture is device-wide).
     let sound = sdl.audio().ok();
-    let mut pane = match open_coherence_surface(&video, &cfg, package, false, sound.as_ref()) {
+    let mut pane = match open_coherence_surface(&video, &cfg, package, false, sound.as_ref(), lease)
+    {
         Ok(pane) => pane,
         Err(e) => {
             eprintln!("✗ {package}: {e}");
@@ -804,7 +848,7 @@ pub fn run() {
 
     // Test hook: open a LIVE scrcpy surface at startup (needs a booted device).
     if std::env::var("ANDROLON_LIVE").is_ok() {
-        match open_live_surface(&video, &cfg) {
+        match open_live_surface(&video, &cfg, wait_for_runtime(&sdl)) {
             Ok(pane) => {
                 println!("✓ live surface opened (id {})", pane.id);
                 panes.push(pane);
@@ -817,7 +861,7 @@ pub fn run() {
     // e.g. ANDROLON_COHERENCE=com.android.settings (comma-separate for several).
     if let Ok(pkgs) = std::env::var("ANDROLON_COHERENCE") {
         for pkg in pkgs.split(',').filter(|p| !p.is_empty()) {
-            match open_coherence_surface(&video, &cfg, pkg, true, None) {
+            match open_coherence_surface(&video, &cfg, pkg, true, None, wait_for_runtime(&sdl)) {
                 Ok(pane) => {
                     println!("✓ coherence window for {pkg} (id {})", pane.id);
                     panes.push(pane);
@@ -914,7 +958,7 @@ pub fn run() {
 
         // Honour an "open LIVE surface" (scrcpy) request from the UI.
         if app.take_open_live() {
-            match open_live_surface(&video, &cfg) {
+            match open_live_surface(&video, &cfg, wait_for_runtime(&sdl)) {
                 Ok(pane) => {
                     app.log_line(format!("✓ live surface (id {})", pane.id));
                     panes.push(pane);

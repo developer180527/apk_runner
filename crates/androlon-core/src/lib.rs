@@ -18,6 +18,6 @@ pub use config::SdkConfig;
 pub use emulator::EmulatorService;
 pub use error::{EngineError, Result};
 pub use model::{
-    Avd, BootProfile, DoctorReport, RootStatus, RuntimeKind, ToolCheck, WindowMode,
+    avd_home, Avd, BootProfile, DoctorReport, RootStatus, RuntimeKind, ToolCheck, WindowMode,
 };
 pub use waydroid::WaydroidBackend;
