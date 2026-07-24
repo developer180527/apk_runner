@@ -189,6 +189,41 @@ fn filetime_touch(bundle: &Path) -> std::io::Result<()> {
     Command::new("touch").arg(bundle).output().map(|_| ())
 }
 
+/// Find the generated `.app` that runs `package`, if one exists. Bundles are
+/// matched on the `ANDROLON_APP` value we write into `LSEnvironment`, not on
+/// their name — labels get sanitised and users rename things.
+pub fn find_bundle_for_package(package: &str) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(&home).join("Applications"));
+    }
+    roots.push(PathBuf::from("/Applications"));
+
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "app") {
+                continue;
+            }
+            let Ok(plist) = std::fs::read_to_string(path.join("Contents/Info.plist")) else {
+                continue;
+            };
+            let marker = format!("<key>ANDROLON_APP</key>");
+            if let Some(at) = plist.find(&marker) {
+                let rest = &plist[at + marker.len()..];
+                if let (Some(start), Some(end)) = (rest.find("<string>"), rest.find("</string>")) {
+                    let value = rest[start + "<string>".len()..end].trim();
+                    if value == package {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Pull the value after `key` up to the closing quote.
 fn extract(badging: &str, key: &str) -> Option<String> {
     let start = badging.find(key)? + key.len();

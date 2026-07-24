@@ -1051,13 +1051,34 @@ fn library_action(
                 let _ = lib_tx.send(None);
             }
             LibraryRequest::Uninstall(pkg) => {
-                let adb = androlon_core::AdbService::new(&cfg);
-                match adb.adb(&["uninstall", &pkg]) {
-                    Ok(out) if out.ok() => log(format!("✓ uninstalled {pkg}")),
-                    Ok(out) => log(format!("✗ uninstall {pkg}: {}", out.trimmed())),
-                    Err(e) => log(format!("✗ uninstall {pkg}: {e}")),
+                // If the app has a Mac bundle, hand it to the Uninstaller —
+                // it removes both halves and confirms first. Only fall back
+                // to a bare package uninstall when there's no bundle to
+                // remove, which is the one case the Uninstaller can't handle.
+                match androlon_core::appify::find_bundle_for_package(&pkg) {
+                    Some(bundle) => {
+                        let tool = std::env::current_exe()
+                            .map(|p| p.with_file_name("androlon-uninstaller"))
+                            .unwrap_or_else(|_| "androlon-uninstaller".into());
+                        match std::process::Command::new(&tool).arg(&bundle).spawn() {
+                            Ok(_) => log(format!("› uninstalling {pkg} — confirm in the window")),
+                            Err(e) => log(format!("✗ uninstaller: {e}")),
+                        }
+                        // The listing refreshes on the next Refresh: the
+                        // Uninstaller is a separate process and the user may
+                        // still cancel it.
+                        let _ = lib_tx.send(None);
+                    }
+                    None => {
+                        let adb = androlon_core::AdbService::new(&cfg);
+                        match adb.adb(&["uninstall", &pkg]) {
+                            Ok(out) if out.ok() => log(format!("✓ uninstalled {pkg}")),
+                            Ok(out) => log(format!("✗ uninstall {pkg}: {}", out.trimmed())),
+                            Err(e) => log(format!("✗ uninstall {pkg}: {e}")),
+                        }
+                        refresh(&lib_tx);
+                    }
                 }
-                refresh(&lib_tx);
             }
             LibraryRequest::MakeApp(pkg) => {
                 // The APK already lives on the device — pull it back so the
