@@ -1,0 +1,51 @@
+[package]
+name = "androlon-installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "androlon-installer"
+path = "src/main.rs"
+
+[dependencies]
+androlon-core = { path = "../androlon-core" }
+
+# Native macOS chrome. The engine stays portable; only this shell is per-OS —
+# a Linux/Windows installer would swap these for GTK/WinUI without touching
+# androlon-core.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSTextField",
+    "NSImageView",
+    "NSImage",
+    "NSProgressIndicator",
+    "NSOpenPanel",
+    "NSSavePanel",
+    "NSPanel",
+    "NSResponder",
+    "NSGraphics",
+    "NSColor",
+    "NSFont",
+    "NSStackView",
+    "NSLayoutConstraint",
+    "NSRunningApplication",
+    "NSAlert",
+    "NSEvent",
+    "NSBox",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSGeometry",
+    "NSArray",
+    "NSURL",
+    "NSThread",
+    "NSObjCRuntime",
+    "NSNotification",
+] }

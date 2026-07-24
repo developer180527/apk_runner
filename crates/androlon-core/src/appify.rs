@@ -178,10 +178,27 @@ fn extract(badging: &str, key: &str) -> Option<String> {
     Some(badging[start..start + end].to_string())
 }
 
-/// Find the highest-density raster icon in the APK and convert it to
-/// Resources/app.icns. Returns Ok(false) when no usable raster icon exists
-/// (e.g. adaptive-XML-only icons with no fallback).
-fn build_icns(badging: &str, apk: &Path, res_dir: &Path) -> std::result::Result<bool, String> {
+/// Extract the APK's best raster icon to `dest` (PNG/WebP bytes as stored).
+/// Returns false when the APK has no usable raster icon. Used by the native
+/// installer to show the real app icon before anything is installed.
+pub fn extract_icon(cfg: &SdkConfig, apk: &Path, dest: &Path) -> Result<bool> {
+    let apk_str = apk.display().to_string();
+    let badging = run_capture(&cfg.aapt2(), &["dump", "badging", &apk_str])?;
+    match icon_source(&badging, apk) {
+        Ok(Some(src)) => {
+            std::fs::copy(&src, dest).map_err(io_err("copy icon"))?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(EngineError::Launch {
+            tool: "extract icon".into(),
+            source: std::io::Error::other(e),
+        }),
+    }
+}
+
+/// Locate the APK's densest raster icon, materialising it in a temp dir.
+fn icon_source(badging: &str, apk: &Path) -> std::result::Result<Option<PathBuf>, String> {
     // aapt2 lists application-icon-<density> lines in ascending density.
     let mut icon_path: Option<String> = None;
     for line in badging.lines() {
@@ -209,48 +226,53 @@ fn build_icns(badging: &str, apk: &Path, res_dir: &Path) -> std::result::Result<
             return Err(format!("could not extract {icon_path}"));
         }
         std::fs::write(&raw, &extracted.stdout).map_err(|e| e.to_string())?;
-    } else {
-        // Adaptive-icon APKs badge only XML, and shrunk release builds
-        // obfuscate resource names — so extract the APK's rasters, measure
-        // them, and take the largest square one (launcher icons ship as a
-        // 48..512px density ladder; the biggest square is the densest icon).
-        let rasters = tmp.join("rasters");
-        let _ = Command::new("unzip")
-            .args(["-o", "-q"])
-            .arg(apk)
-            .args(["res/*.png", "res/*.webp", "-d"])
-            .arg(&rasters)
+        return Ok(Some(raw));
+    }
+
+    // Adaptive-icon APKs badge only XML, and shrunk release builds obfuscate
+    // resource names — so extract the APK's rasters, measure them, and take
+    // the largest square one (launcher icons ship as a 48..512px density
+    // ladder; the biggest square is the densest icon).
+    let rasters = tmp.join("rasters");
+    let _ = Command::new("unzip")
+        .args(["-o", "-q"])
+        .arg(apk)
+        .args(["res/*.png", "res/*.webp", "-d"])
+        .arg(&rasters)
+        .output()
+        .map_err(|e| format!("unzip: {e}"))?;
+    let mut best: Option<(u32, PathBuf)> = None;
+    let entries =
+        std::fs::read_dir(rasters.join("res")).map_err(|_| "no raster resources in APK".to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let out = Command::new("sips")
+            .args(["-g", "pixelWidth", "-g", "pixelHeight"])
+            .arg(&path)
             .output()
-            .map_err(|e| format!("unzip: {e}"))?;
-        let mut best: Option<(u32, PathBuf)> = None;
-        let entries = std::fs::read_dir(rasters.join("res"))
-            .map_err(|_| "no raster resources in APK".to_string())?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let out = Command::new("sips")
-                .args(["-g", "pixelWidth", "-g", "pixelHeight"])
-                .arg(&path)
-                .output()
-                .map_err(|e| format!("sips: {e}"))?;
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let dim = |key: &str| -> Option<u32> {
-                let line = text.lines().find(|l| l.contains(key))?;
-                line.rsplit(' ').next()?.parse().ok()
-            };
-            if let (Some(w), Some(h)) = (dim("pixelWidth"), dim("pixelHeight")) {
-                if w == h
-                    && (48..=1024).contains(&w)
-                    && best.as_ref().map_or(true, |(bw, _)| w > *bw)
-                {
-                    best = Some((w, path));
-                }
+            .map_err(|e| format!("sips: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let dim = |key: &str| -> Option<u32> {
+            let line = text.lines().find(|l| l.contains(key))?;
+            line.rsplit(' ').next()?.parse().ok()
+        };
+        if let (Some(w), Some(h)) = (dim("pixelWidth"), dim("pixelHeight")) {
+            if w == h && (48..=1024).contains(&w) && best.as_ref().map_or(true, |(bw, _)| w > *bw) {
+                best = Some((w, path));
             }
         }
-        let Some((_, path)) = best else {
-            return Ok(false); // vector-only app; no raster to use
-        };
-        std::fs::copy(&path, &raw).map_err(|e| e.to_string())?;
     }
+    Ok(best.map(|(_, path)| path))
+}
+
+/// Find the highest-density raster icon in the APK and convert it to
+/// Resources/app.icns. Returns Ok(false) when no usable raster icon exists
+/// (e.g. adaptive-XML-only icons with no fallback).
+fn build_icns(badging: &str, apk: &Path, res_dir: &Path) -> std::result::Result<bool, String> {
+    let Some(raw) = icon_source(badging, apk)? else {
+        return Ok(false); // vector-only app; no raster to use
+    };
+    let tmp = raw.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     // sips reads png/webp; write the standard iconset sizes, then iconutil.
     let iconset = tmp.join("app.iconset");
